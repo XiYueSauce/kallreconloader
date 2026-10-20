@@ -306,7 +306,7 @@ deps.lst      →  KallRecon b258fb67…（KallRecon 提交）
 ```bash
 ./scripts/fetch-deps.sh                                   # 拉 SDK + deps/KallRecon
 ./scripts/check.sh                                        # 语法/资源/配置解析
-make KDIR=/opt/ddk/kdir/android16-6.12 VER=android16-6.12  # 单版本
+make KDIR=/opt/ddk/kdir/android16-6.12                     # 单版本，VER 自动推导
 ./build-all.sh                                            # 遍历 /opt/ddk/src
 TARGETS="android14-6.1 android16-6.12" ./scripts/package.sh # 也可不带 TARGETS
 ```

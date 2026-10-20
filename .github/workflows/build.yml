@@ -42,7 +42,14 @@ jobs:
             echo "::group::build $t"
             ddk pull "$t"
             ddk build --target "$t"
-            test -f "out/$t/lkmloader.ko"
+            ko="out/$t/lkmloader.ko"
+            if [ ! -f "$ko" ]; then
+              found=$(find out -name lkmloader.ko -type f | head -n1)
+              [ -n "$found" ] || { echo "!! $t produced no lkmloader.ko"; exit 1; }
+              mkdir -p "out/$t"
+              mv "$found" "$ko"
+            fi
+            echo "built $(wc -c <"$ko" | tr -d ' ') bytes -> $ko"
             echo "::endgroup::"
           done
 

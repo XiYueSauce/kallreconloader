@@ -67,7 +67,7 @@ lkmloader/
 ./scripts/check.sh
 
 # 3. 单个版本
-make KDIR=/opt/ddk/kdir/android16-6.12 VER=android16-6.12
+make KDIR=/opt/ddk/kdir/android16-6.12                     # VER 按目录名推导
 
 # 4. 全部版本（输出 out/<target>/lkmloader.ko）
 ./build-all.sh

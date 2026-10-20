@@ -57,6 +57,15 @@
 #define MODULE_INIT_IGNORE_VERMAGIC 2
 #endif
 
+/*
+ * the kernel's uapi elf.h has no SHN_XINDEX (glibc's elf.h does), so define
+ * it here: the extended section index sentinel is the same value as
+ * SHN_HIRESERVE
+ */
+#ifndef SHN_XINDEX
+#define SHN_XINDEX 0xffff
+#endif
+
 #define LKM_VERSION		"1.1.0"
 #define LKM_LOG_SZ		(16 * 1024)
 #define LKM_MSG_SZ		224
