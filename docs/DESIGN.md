@@ -95,6 +95,14 @@ if (!addr) addr = kallrecon_find_variant(name, 1);  /* CFI/LTO 后缀变体，�
 
 为什么这样可行：内核在 `simplify_symbols()` 里只处理 `SHN_UNDEF`，`SHN_ABS` 走“无需处理”分支；后续 `apply_relocations()` 直接用 `st_value` 当绝对地址，于是“非导出符号”被静默绕过。
 
+实测补充：用 ddk 编译本模块时，`__versions` 段是**空的**（长度 0）——因为 modpost 没有内核的
+Module.symvers，拿不到符号 CRC。所以 `symbol_mode=0` 只对“带着完整 `__versions` 的目标 ko”
+才产生实际差别；对这类裸编的 ko，两种模式等价。这一点不要误解成“默认就一定有 CRC 校验”。
+
+实测补充：用 ddk 编译本模块时，`__versions` 段是**空的**（长度 0）——因为 modpost 没有内核的
+Module.symvers，拿不到符号 CRC。所以 `symbol_mode=0` 只对“带着完整 `__versions` 的目标 ko”
+才产生实际差别；对这类裸编的 ko，两种模式等价。这一点不要误解成“默认就一定有 CRC 校验”。
+
 **但“绕过”必须限定范围**：`__versions` 里的条目是链接时由 modpost 从 Module.symvers 生成的，说明该符号
 当时是导出的，内核本来就能解析并做 CRC 校验。把它们也回填成 `SHN_ABS`，等于白白丢掉一次版本校验。
 因此默认 `symbol_mode=0` 只回填“没有版本条目”的符号，日志里分别报 `patched` 与 `native` 两个数字；

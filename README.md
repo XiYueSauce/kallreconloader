@@ -25,6 +25,8 @@ lkmloader.ko ── KallRecon 重建 kallsyms ── patch 目标 ko 的 SHN_UND
 - **有区分的 ELF 回填**：读取目标 `.ko`，把 `.symtab` 中 `SHN_UNDEF` 条目解析成地址并改写为 `SHN_ABS`。
   带 `__versions` 条目的符号说明它链接时是导出的，默认**交还内核**自行解析并做 CRC 校验，
   只有非导出符号才由 loader 回填（`symbol_mode=0`，可在设置里改成全量回填）。
+  注意：不带内核 Module.symvers 编出来的 ko，`__versions` 是空的，此时两种模式等价。
+  注意：不带内核 Module.symvers 编出来的 ko，`__versions` 是空的，此时两种模式等价。
 - **常驻 loader + /proc 控制**：`/proc/lkmctl` 收命令与状态，`/proc/lkmlog` 输出环形日志，
   UI 可实时看到“解析了多少符号、缺了哪些、返回码是多少”。
 - **两种加载时机**：每个 ko 可单独选择 `post-fs-data` / `service` / 手动，支持延迟秒数。

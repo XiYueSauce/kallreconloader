@@ -34,15 +34,15 @@ verify_ko() {
 	b700 | 3e00) ;;
 	*) die "unexpected ELF machine 0x$mach: $ko" ;;
 	esac
-	# vermagic must be present, otherwise it is not a kernel module
-	case "$(grep -a -o 'vermagic=[^ ]*' "$ko" 2>/dev/null | head -n1)" in
+	# vermagic must be present, otherwise it is not a kernel module.
+	# anchor the pattern: a loose grep also matches "ignore_vermagic=%d"
+	vm=$(strings -a "$ko" 2>/dev/null | grep -m1 '^vermagic=')
+	if [ -z "$vm" ]; then
+		vm=$(grep -a -o 'vermagic=[0-9][^ ]*' "$ko" 2>/dev/null | head -n1)
+	fi
+	case "$vm" in
 	vermagic=*) ;;
-	*)
-		case "$(strings -a "$ko" 2>/dev/null | grep -m1 '^vermagic=')" in
-		vermagic=*) ;;
-		*) die "no vermagic in $ko" ;;
-		esac
-		;;
+	*) die "no vermagic in $ko" ;;
 	esac
 }
 
