@@ -27,7 +27,7 @@ verify_ko() {
 	7f454c46*) ;;
 	*) die "not an ELF file: $ko" ;;
 	esac
-	[ "$(printf %s "$h" | cut -c5-6)" = "02" ] || die "not ELF64: $ko"
+	[ "$(printf %s "$h" | cut -c9-10)" = "02" ] || die "not ELF64: $ko"
 	[ "$(printf %s "$h" | cut -c33-34)" = "01" ] || die "not ET_REL (not a module): $ko"
 	mach=$(printf %s "$h" | cut -c37-40)
 	case "$mach" in

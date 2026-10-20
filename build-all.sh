@@ -31,7 +31,7 @@ for ver in $TARGETS; do
 		continue
 		;;
 	esac
-	[ "$(printf %s "$h" | cut -c5-6)" = "02" ] || { echo "!! not ELF64: $ko" >&2; fail=1; continue; }
+	[ "$(printf %s "$h" | cut -c9-10)" = "02" ] || { echo "!! not ELF64: $ko" >&2; fail=1; continue; }
 	[ "$(printf %s "$h" | cut -c33-34)" = "01" ] || { echo "!! not ET_REL: $ko" >&2; fail=1; continue; }
 
 	echo "   ok $(wc -c <"$ko" | tr -d ' ') bytes"

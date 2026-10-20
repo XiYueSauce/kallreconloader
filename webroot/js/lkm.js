@@ -408,7 +408,7 @@
       'h=$(od -An -tx1 -N20 "$src" 2>/dev/null | tr -d " \\n")',
       '[ "${#h}" -ge 40 ] || { echo "!elf"; exit 0; }',
       'case "$h" in 7f454c46*) ;; *) echo "!elf"; exit 0 ;; esac',
-      '[ "$(printf %s "$h" | cut -c5-6)" = "02" ] || { echo "!class"; exit 0; }',
+      '[ "$(printf %s "$h" | cut -c9-10)" = "02" ] || { echo "!class"; exit 0; }',
       '[ "$(printf %s "$h" | cut -c33-34)" = "01" ] || { echo "!type"; exit 0; }',
       'em=$(printf %s "$h" | cut -c37-40)',
       'case "$(uname -m)" in aarch64) want=b700 ;; x86_64) want=3e00 ;; *) want=$em ;; esac',
