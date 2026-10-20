@@ -75,7 +75,7 @@ make KDIR=/opt/ddk/kdir/android16-6.12                     # VER 按目录名推
 ./build-all.sh
 
 # 5. 打包（每个 ko 都会校验 ELF/ET_REL/vermagic，并回读 zip 内容）
-./scripts/package.sh     # -> dist/lkmloader-v1.1.0.zip
+./scripts/package.sh     # -> dist/lkmloader-v1.2.0.zip
 ```
 
 CI 见 `.github/workflows/build.yml`，用 docker 版 ddk 逐个 target 构建后打包。
@@ -118,10 +118,16 @@ insmod /data/adb/modules/lkmloader/ko/lkmloader.ko verbose=1 strict_symbols=1
 echo 'load /data/adb/modules/lkmloader/lkm/foo.ko debug=1' > /proc/lkmctl
 
 # 状态（key=value）
-cat /proc/lkmctl        # kallsyms / num_syms / seq / loads / fails / last_* ...
+cat /proc/lkmctl        # kallsyms / num_syms / seq / cache_* / loads / fails / last_* ...
 cat /proc/lkmlog        # 环形日志，包含每个被回填的符号
-printf 'clear\n' > /proc/lkmctl
+printf 'clear\n' > /proc/lkmctl   # 只清日志
+printf 'flush\n' > /proc/lkmctl   # 清空符号缓存（卸载模块后脚本会自动发）
 ```
+
+符号解析结果会缓存在 loader 里（509 槽开放寻址）：`kallsyms` 查询是十万级的线性扫描，
+同一符号在重载、多模块共享时不必重复扫表。缓存只记录**命中**，查不到的名字每次都重试，
+因为后加载的模块可能正好提供它；卸载时由脚本触发 `flush`，避免拿到已卸载模块的旧地址。
+`cat /proc/lkmctl` 里的 `cache_used` / `cache_hits` / `cache_misses` 可以直接看出效果。
 
 协议约定：**一次 `write()` 一条命令，且必须以 `\n` 结尾**。内核需要把命令末尾的换行改写成 NUL
 才能得到 `load_module()` 需要的用户空间参数指针，没有换行时无法在不越界的前提下做到，命令会被拒绝。

@@ -176,6 +176,8 @@ lkm_unload_one() {
 		echo "state=failed:${_out:-rmmod failed}"
 		return 1
 	fi
+	# some cached addresses may have come from the module that just left
+	printf 'flush\n' >/proc/lkmctl 2>/dev/null
 	echo "state=unloaded"
 	return 0
 }

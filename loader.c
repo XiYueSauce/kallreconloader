@@ -66,7 +66,7 @@
 #define SHN_XINDEX 0xffff
 #endif
 
-#define LKM_VERSION		"1.1.0"
+#define LKM_VERSION		"1.2.0"
 #define LKM_LOG_SZ		(16 * 1024)
 #define LKM_MSG_SZ		224
 #define LKM_NAME_SZ		64
@@ -124,6 +124,117 @@ static int lkm_last_miss;
 static unsigned int lkm_loads;
 static unsigned int lkm_fails;
 static unsigned int lkm_seq;
+
+/* ------------------------------------------------------------ symbol cache */
+/*
+ * kallsyms lookup is a linear scan over ~100k names, so resolving a few
+ * hundred undefined symbols per module is the dominant cost of a load.
+ * Only positive results are cached: a name that is missing right now may be
+ * provided by a module loaded later, so a miss must always be retried.
+ * Entries are dropped on "flush" (the scripts send it after an unload) so a
+ * symbol that came from a module can never be served from a stale address.
+ */
+#define LKM_CACHE_SLOTS		509
+#define LKM_CACHE_NAME		48
+
+struct lkm_cache_ent {
+	char name[LKM_CACHE_NAME];
+	unsigned long addr;
+	bool used;
+};
+
+static struct lkm_cache_ent lkm_cache[LKM_CACHE_SLOTS];
+static unsigned int lkm_cache_used;
+static unsigned int lkm_cache_hits;
+static unsigned int lkm_cache_misses;
+
+static u32 lkm_hash_n(const char *s, size_t n)
+{
+	u32 h = 2166136261u;
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		h ^= (u8)s[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+static u32 lkm_hash(const char *s)
+{
+	return lkm_hash_n(s, strlen(s));
+}
+
+/* returns the matching slot, the first free slot, or NULL when full */
+static struct lkm_cache_ent *lkm_cache_slot(const char *name, u32 h, bool *hit)
+{
+	unsigned int i;
+
+	*hit = false;
+	h %= LKM_CACHE_SLOTS;		/* keeps (h + i) from wrapping */
+	for (i = 0; i < LKM_CACHE_SLOTS; i++) {
+		struct lkm_cache_ent *e = &lkm_cache[(h + i) % LKM_CACHE_SLOTS];
+
+		if (!e->used)
+			return e;
+		if (!strcmp(e->name, name)) {
+			*hit = true;
+			return e;
+		}
+	}
+	return NULL;
+}
+
+static unsigned long lkm_cache_get(const char *name)
+{
+	struct lkm_cache_ent *e;
+	bool hit;
+	u32 h;
+
+	if (strnlen(name, LKM_CACHE_NAME) >= LKM_CACHE_NAME) {
+		lkm_cache_misses++;
+		return 0;
+	}
+
+	h = lkm_hash(name);
+	e = lkm_cache_slot(name, h, &hit);
+	if (e && hit) {
+		lkm_cache_hits++;
+		return e->addr;
+	}
+
+	lkm_cache_misses++;
+	return 0;
+}
+
+static void lkm_cache_put(const char *name, unsigned long addr)
+{
+	struct lkm_cache_ent *e;
+	bool hit;
+
+	if (!addr || strnlen(name, LKM_CACHE_NAME) >= LKM_CACHE_NAME)
+		return;
+
+	e = lkm_cache_slot(name, lkm_hash(name), &hit);
+	if (!e)
+		return;
+	if (hit) {
+		e->addr = addr;		/* refresh, never duplicate a name */
+		return;
+	}
+	strscpy(e->name, name, sizeof(e->name));
+	e->addr = addr;
+	e->used = true;
+	lkm_cache_used++;
+}
+
+static void lkm_cache_flush(void)
+{
+	memset(lkm_cache, 0, sizeof(lkm_cache));
+	lkm_cache_used = 0;
+	lkm_cache_hits = 0;
+	lkm_cache_misses = 0;
+}
 
 /* -------------------------------------------------------------------- log */
 
@@ -230,6 +341,8 @@ struct lkm_versions {
 	const struct lkm_ver_entry *tab;
 	unsigned int count;
 	bool valid;
+	u32 *index;		/* entry index + 1, 0 marks a free slot */
+	unsigned int mask;
 };
 
 /*
@@ -242,10 +355,13 @@ static void lkm_versions_load(void *buf, Elf64_Ehdr *eh, Elf64_Shdr *sh,
 			      size_t len, struct lkm_versions *v)
 {
 	struct lkm_section sec;
+	unsigned int i, size;
 
 	v->tab = NULL;
 	v->count = 0;
 	v->valid = false;
+	v->index = NULL;
+	v->mask = 0;
 
 	if (!lkm_find_section(buf, eh, sh, shnum, entsize, len, "__versions", &sec))
 		return;
@@ -257,22 +373,64 @@ static void lkm_versions_load(void *buf, Elf64_Ehdr *eh, Elf64_Shdr *sh,
 	v->tab = (const struct lkm_ver_entry *)((char *)buf + sec.off);
 	v->count = (unsigned int)(sec.size / sizeof(struct lkm_ver_entry));
 	v->valid = true;
+
+	/* open addressing needs a power of two at least twice the entry count */
+	for (size = 8; size < v->count * 2; size <<= 1) {
+		/* grow to the next power of two */
+	}
+	v->index = kvcalloc(size, sizeof(u32), GFP_KERNEL);
+	if (!v->index)
+		return;		/* lookup falls back to a linear scan */
+	v->mask = size - 1;
+
+	for (i = 0; i < v->count; i++) {
+		const char *n = v->tab[i].name;
+		size_t l = strnlen(n, LKM_VER_NAME_LEN);
+		unsigned int j;
+
+		if (!l || l >= LKM_VER_NAME_LEN)
+			continue;
+		for (j = 0; j <= v->mask; j++) {
+			u32 *slot = &v->index[(lkm_hash_n(n, l) + j) & v->mask];
+
+			if (!*slot) {
+				*slot = i + 1;
+				break;
+			}
+		}
+	}
 }
 
 static bool lkm_versions_has(const struct lkm_versions *v, const char *name)
 {
 	size_t l = strnlen(name, LKM_VER_NAME_LEN);
 	unsigned int i;
+	u32 h;
 
 	if (!v->valid || !l || l >= LKM_VER_NAME_LEN)
 		return false;
 
-	for (i = 0; i < v->count; i++) {
-		const char *n = v->tab[i].name;
+	if (!v->index) {			/* linear fallback */
+		for (i = 0; i < v->count; i++) {
+			const char *n = v->tab[i].name;
 
-		if (n[l] != '\0')
-			continue;
-		if (!memcmp(n, name, l))
+			if (n[l] != '\0')
+				continue;
+			if (!memcmp(n, name, l))
+				return true;
+		}
+		return false;
+	}
+
+	h = lkm_hash_n(name, l);
+	for (i = 0; i <= v->mask; i++) {
+		u32 slot = v->index[(h + i) & v->mask];
+		const char *n;
+
+		if (!slot)
+			return false;
+		n = v->tab[slot - 1].name;
+		if (n[l] == '\0' && !memcmp(n, name, l))
 			return true;
 	}
 
@@ -283,10 +441,15 @@ static bool lkm_versions_has(const struct lkm_versions *v, const char *name)
 
 static unsigned long lkm_resolve(const char *name, bool *via_variant)
 {
-	unsigned long addr = 0;
+	unsigned long addr;
+	bool variant = false;
 
 	if (via_variant)
 		*via_variant = false;
+
+	addr = lkm_cache_get(name);
+	if (addr)
+		return addr;
 
 	if (kallrecon_klp)
 		addr = kallrecon_klp(name);
@@ -294,8 +457,14 @@ static unsigned long lkm_resolve(const char *name, bool *via_variant)
 		addr = kallsyms_name_to_addr(name);
 	if (!addr) {
 		addr = kallrecon_find_variant(name, 1);
-		if (addr && via_variant)
-			*via_variant = true;
+		if (addr)
+			variant = true;
+	}
+
+	if (addr) {
+		lkm_cache_put(name, addr);
+		if (via_variant)
+			*via_variant = variant;
 	}
 
 	return addr;
@@ -442,6 +611,8 @@ static int lkm_patch_image(void *buf, size_t len, int *out_patched,
 	lkm_log_add("symbols: %d patched, %d native, %d unresolved, %d weak",
 		    patched, native, miss, weak);
 
+	kvfree(versions.index);
+
 	if (miss && strict_symbols) {
 		lkm_log_add("abort: %d unresolved symbol(s), strict mode", miss);
 		return -ENOENT;
@@ -566,44 +737,47 @@ out_msg:
 
 /* -------------------------------------------------------------- /proc glue */
 
+/* sized for the status lines below; written under lkm_lock */
+#define LKM_CTL_SZ	1792
+
+static char lkm_ctl_buf[LKM_CTL_SZ];
+
 static ssize_t lkmctl_read(struct file *file, char __user *ubuf,
 			   size_t count, loff_t *ppos)
 {
-	char *tmp;
-	int n = 0;
+	char *tmp = lkm_ctl_buf;
 	ssize_t ret;
-
-	tmp = kmalloc(1536, GFP_KERNEL);
-	if (!tmp)
-		return -ENOMEM;
+	int n = 0;
 
 	mutex_lock(&lkm_lock);
-	n += scnprintf(tmp + n, 1536 - n, "loader=lkmloader\n");
-	n += scnprintf(tmp + n, 1536 - n, "version=%s\n", LKM_VERSION);
-	n += scnprintf(tmp + n, 1536 - n, "kallsyms=%d\n", klnum_val ? 1 : 0);
-	n += scnprintf(tmp + n, 1536 - n, "num_syms=%u\n", klnum_val);
-	n += scnprintf(tmp + n, 1536 - n, "layout=%d\n", (int)kl_layout);
-	n += scnprintf(tmp + n, 1536 - n, "kernel_base=0x%lx\n", kernel_base);
-	n += scnprintf(tmp + n, 1536 - n, "seq=%u\n", lkm_seq);
-	n += scnprintf(tmp + n, 1536 - n, "loads=%u\n", lkm_loads);
-	n += scnprintf(tmp + n, 1536 - n, "fails=%u\n", lkm_fails);
-	n += scnprintf(tmp + n, 1536 - n, "symbol_mode=%d\n", symbol_mode ? 1 : 0);
-	n += scnprintf(tmp + n, 1536 - n, "strict_symbols=%d\n",
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "loader=lkmloader\n");
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "version=%s\n", LKM_VERSION);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "kallsyms=%d\n", klnum_val ? 1 : 0);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "num_syms=%u\n", klnum_val);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "layout=%d\n", (int)kl_layout);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "kernel_base=0x%lx\n", kernel_base);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "seq=%u\n", lkm_seq);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "loads=%u\n", lkm_loads);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "fails=%u\n", lkm_fails);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "symbol_mode=%d\n", symbol_mode ? 1 : 0);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "strict_symbols=%d\n",
 		       strict_symbols ? 1 : 0);
-	n += scnprintf(tmp + n, 1536 - n, "ignore_vermagic=%d\n",
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "ignore_vermagic=%d\n",
 		       ignore_vermagic ? 1 : 0);
-	n += scnprintf(tmp + n, 1536 - n, "ignore_modversions=%d\n",
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "ignore_modversions=%d\n",
 		       ignore_modversions ? 1 : 0);
-	n += scnprintf(tmp + n, 1536 - n, "last_target=%s\n", lkm_last_target);
-	n += scnprintf(tmp + n, 1536 - n, "last_patched=%d\n", lkm_last_patched);
-	n += scnprintf(tmp + n, 1536 - n, "last_native=%d\n", lkm_last_native);
-	n += scnprintf(tmp + n, 1536 - n, "last_miss=%d\n", lkm_last_miss);
-	n += scnprintf(tmp + n, 1536 - n, "last_errno=%d\n", lkm_last_errno);
-	n += scnprintf(tmp + n, 1536 - n, "last_msg=%s\n", lkm_last_msg);
-	mutex_unlock(&lkm_lock);
-
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "cache_used=%u\n", lkm_cache_used);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "cache_hits=%u\n", lkm_cache_hits);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "cache_misses=%u\n",
+		       lkm_cache_misses);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "last_target=%s\n", lkm_last_target);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "last_patched=%d\n", lkm_last_patched);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "last_native=%d\n", lkm_last_native);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "last_miss=%d\n", lkm_last_miss);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "last_errno=%d\n", lkm_last_errno);
+	n += scnprintf(tmp + n, LKM_CTL_SZ - n, "last_msg=%s\n", lkm_last_msg);
 	ret = simple_read_from_buffer(ubuf, count, ppos, tmp, n);
-	kfree(tmp);
+	mutex_unlock(&lkm_lock);
 
 	return ret;
 }
@@ -673,6 +847,13 @@ static ssize_t lkmctl_write(struct file *file, const char __user *ubuf,
 		lkm_last_target[1] = '\0';
 		lkm_last_errno = 0;
 		lkm_log_add("log cleared");
+		goto unlock;
+	}
+
+	if (!strcmp(cmd, "flush")) {
+		lkm_cache_flush();
+		snprintf(lkm_last_msg, sizeof(lkm_last_msg), "symbol cache flushed");
+		lkm_log_add("symbol cache flushed");
 		goto unlock;
 	}
 
@@ -795,6 +976,7 @@ static int __init lkm_init(void)
 	lkm_load_module_fn =
 		(int (*)(struct load_info *, const char __user *, int))addr;
 	lkm_log_add("load_module @ 0x%lx, symbol_mode %d", addr, symbol_mode);
+	lkm_cache_flush();
 
 	if (!proc_create("lkmctl", 0600, NULL, &lkmctl_ops))
 		return -ENOMEM;

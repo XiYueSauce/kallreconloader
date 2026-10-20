@@ -216,6 +216,9 @@
         layout: ctl.layout != null ? ctl.layout : '',
         loads: parseInt(ctl.loads || '0', 10) || 0,
         fails: parseInt(ctl.fails || '0', 10) || 0,
+        seq: parseInt(ctl.seq || '0', 10) || 0,
+        cacheHits: parseInt(ctl.cache_hits || '0', 10) || 0,
+        cacheUsed: parseInt(ctl.cache_used || '0', 10) || 0,
         symbolMode: ctl.symbol_mode === '1' ? 1 : 0,
         loaderVersion: ctl.version || '',
         lastTarget: ctl.last_target || '',
@@ -561,11 +564,22 @@
           device: 'Xiaomi 23127PN0CC (arm64-v8a)',
           soc: 'sun', android: '16', abi: 'arm64-v8a', selinux: 'Enforcing',
           manager: 'KernelSU', blocked: false,
-          symbols: 142103, layout: '2', loads: 1, fails: 0,
-          symbolMode: 0, loaderVersion: '1.1.0', lastTarget: 'droid_lkm.ko',
+          symbols: 142103, layout: '2', loads: 1, fails: 0, seq: 7,
+          cacheUsed: 38, cacheHits: 12,
+          symbolMode: 0, loaderVersion: '1.2.0', lastTarget: 'droid_lkm.ko',
           lastPatched: 11, lastNative: 6,
           lastErrno: '0', lastMsg: 'loaded droid_lkm.ko (patched 11, native 6)',
           compat: true
+        });
+      },
+      ctl: function () {
+        return Promise.resolve({
+          loader: 'lkmloader', version: '1.2.0', num_syms: '142103',
+          layout: '2', seq: '7', loads: '1', fails: '0', symbol_mode: '0',
+          cache_used: '38', cache_hits: '12', cache_misses: '94',
+          last_target: 'droid_lkm.ko', last_patched: '11', last_native: '6',
+          last_miss: '0', last_errno: '0',
+          last_msg: 'loaded droid_lkm.ko (patched 11, native 6)'
         });
       },
       modules: function () {
@@ -585,7 +599,7 @@
       unloadOne: function () { return Promise.resolve({ ok: true, state: 'unloaded', out: 'state=unloaded' }); },
       reloadOne: function () { return Promise.resolve({ ok: true, out: 'demo' }); },
       restartLoader: function () {
-        return Promise.resolve({ ok: true, up: true, syms: 142103, version: '1.1.0', mode: '0', out: 'state=up' });
+        return Promise.resolve({ ok: true, up: true, syms: 142103, version: '1.2.0', mode: '0', out: 'state=up' });
       },
       clearLog: function () { demoLogs.loader = ''; return Promise.resolve(); },
       sanitizeArgs: sanitizeArgs,
@@ -609,7 +623,7 @@
         });
       },
       meta: function () {
-        return Promise.resolve({ id: 'lkmloader', version: 'v1.1.0', name: 'LKM Loader' });
+        return Promise.resolve({ id: 'lkmloader', version: 'v1.2.0', name: 'LKM Loader' });
       },
       listDir: function (path) {
         var rows = path === '/sdcard/Download' ? [
@@ -636,6 +650,7 @@
     sanitizeName: sanitizeName,
     sanitizeArgs: sanitizeArgs,
     status: status,
+    ctl: readCtl,
     modules: refreshModules,
     loadConfig: loadConfig,
     saveConfig: saveConfig,

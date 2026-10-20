@@ -7,6 +7,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   TARGETS: >-
     android12-5.10
@@ -17,7 +21,8 @@ env:
     android16-6.12
 
 jobs:
-  build:
+  # dependency deploy and static checks run once, before anything is compiled
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,31 +35,81 @@ jobs:
       - name: static checks
         run: ./scripts/check.sh
 
+  # one job per KMI: a failure only loses that target, and the wall clock is
+  # the slowest single build instead of the sum of all of them
+  build:
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: deploy deps (KMSDK + KallRecon)
+        run: |
+          chmod +x scripts/*.sh build-all.sh
+          ./scripts/fetch-deps.sh
+
       - name: install ddk
         run: |
           sudo curl -fsSL https://raw.githubusercontent.com/Ylarod/ddk/main/scripts/ddk -o /usr/local/bin/ddk
           sudo chmod +x /usr/local/bin/ddk
 
-      - name: build every target
+      - name: build ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -e
-          for t in $TARGETS; do
-            echo "::group::build $t"
-            ddk pull "$t"
-            ddk build --target "$t"
-            ko="out/$t/lkmloader.ko"
-            if [ ! -f "$ko" ]; then
-              found=$(find out -name lkmloader.ko -type f | head -n1)
-              [ -n "$found" ] || { echo "!! $t produced no lkmloader.ko"; exit 1; }
-              mkdir -p "out/$t"
-              mv "$found" "$ko"
-            fi
-            echo "built $(wc -c <"$ko" | tr -d ' ') bytes -> $ko"
-            echo "::endgroup::"
+          ddk pull "$TARGET"
+          ddk build --target "$TARGET"
+          ko="out/$TARGET/lkmloader.ko"
+          if [ ! -f "$ko" ]; then
+            found=$(find out -name lkmloader.ko -type f | head -n1)
+            [ -n "$found" ] || { echo "!! $TARGET produced no lkmloader.ko"; exit 1; }
+            mkdir -p "out/$TARGET"
+            mv "$found" "$ko"
+          fi
+          echo "built $(wc -c <"$ko" | tr -d ' ') bytes -> $ko"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ko-${{ matrix.target }}
+          path: out/${{ matrix.target }}/lkmloader.ko
+          if-no-files-found: error
+
+  # collect every ko, verify them together and produce the flashable zip
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: collect ko files
+        run: |
+          set -e
+          for d in artifacts/ko-*; do
+            t=${d#artifacts/ko-}
+            mkdir -p "out/$t"
+            find "$d" -name lkmloader.ko -exec cp {} "out/$t/lkmloader.ko" \;
           done
+          ls -l out/*/lkmloader.ko
 
       - name: package module zip
-        run: TARGETS="$TARGETS" ./scripts/package.sh
+        run: |
+          chmod +x scripts/*.sh
+          TARGETS="$TARGETS" ./scripts/package.sh
 
       - uses: actions/upload-artifact@v4
         with:

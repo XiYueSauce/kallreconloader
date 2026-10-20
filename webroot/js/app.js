@@ -181,6 +181,9 @@
     $('#set-layout').textContent = s.layout === '' ? '—' : 'v' + s.layout;
     $('#set-mode').textContent = s.symbolMode ? '全部回填' : '仅非导出';
     $('#set-counts').textContent = s.loads + ' / ' + s.fails;
+    $('#set-cache').textContent = s.cacheUsed
+      ? s.cacheUsed + ' 条 · 命中 ' + (s.cacheHits || 0)
+      : '—';
 
     renderParams();
   }
@@ -756,11 +759,43 @@
     });
   }
 
+  /*
+   * Cheap poll: one `cat /proc/lkmctl` instead of pulling the whole log every
+   * tick. The loader bumps `seq` for every operation, so the log is re-read
+   * only when something actually happened.
+   */
+  function pollStatus() {
+    return LKM.ctl().then(function (ctl) {
+      var prev = state.status || {};
+      if (!ctl || ctl.loader !== 'lkmloader') {
+        return refreshStatus();
+      }
+      var seq = parseInt(ctl.seq || '0', 10) || 0;
+      state.status = Object.assign({}, prev, {
+        seq: seq,
+        loaderUp: true,
+        symbols: parseInt(ctl.num_syms || '0', 10) || 0,
+        layout: ctl.layout != null ? ctl.layout : '',
+        loads: parseInt(ctl.loads || '0', 10) || 0,
+        fails: parseInt(ctl.fails || '0', 10) || 0,
+        cacheUsed: parseInt(ctl.cache_used || '0', 10) || 0,
+        cacheHits: parseInt(ctl.cache_hits || '0', 10) || 0,
+        lastTarget: ctl.last_target || '',
+        lastPatched: parseInt(ctl.last_patched || '0', 10) || 0,
+        lastNative: parseInt(ctl.last_native || '0', 10) || 0,
+        lastErrno: ctl.last_errno,
+        lastMsg: ctl.last_msg || ''
+      });
+      renderStatus();
+      if (seq !== (parseInt(prev.seq || '0', 10) || 0)) return refreshLogs();
+    });
+  }
+
   function startPoll() {
     stopPoll();
     state.poll = setInterval(function () {
       if (document.hidden || state.busy) return;
-      if (state.view === 'status') refreshLogs();
+      if (state.view === 'status') pollStatus().catch(function () {});
       if (state.view === 'modules') refreshModules().catch(function () {});
     }, 8000);
   }

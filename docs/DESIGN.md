@@ -329,7 +329,9 @@ Makefile 的两个细节：
 - `deps/KallRecon/deps.mk` 提供 `DEPS_LIB_OBJS`（含 `lib/anchor.o`，锚点汇编按 arch 自选），用 `addprefix` 挂到模块对象里
 - 6.10+ 内核把源文件规则从 `$(src)` 改成 `$(obj)`，因此显式补了 `$(obj)/%.o: $(src)/%.c` 与 `.S` 两条规则（否则 android16-6.12 上找不到源文件）
 
-CI：`.github/workflows/build.yml`，docker 版 ddk 逐个 target 构建 → 校验产物 → 打包 → tag 时发 Release。
+CI：`.github/workflows/build.yml` 分三段——`check`（依赖部署 + 静态检查）、`build`（6 个 KMI 的矩阵任务并行）、
+`package`（汇总产物、校验、打包，tag 时发 Release）。矩阵化的收益是失败只影响单个 KMI，
+且总时长等于最慢的单个构建而不是六个之和；`concurrency` 会取消同分支被覆盖的旧运行。
 
 ---
 
@@ -421,7 +423,45 @@ CI：`.github/workflows/build.yml`，docker 版 ddk 逐个 target 构建 → 校
 - **按操作 ID 建立完整结果记录表**：`seq` + `last_*` 已能覆盖单人操作场景；完整历史属于日志职责。
 - **`load_module()` 私有接口**：这是整个方案的前提，只能靠实机验证，不能靠代码消除。
 
-## 11. 参考
+## 11. v1.2.0 优化
+
+审计项处理完之后，按实机收益从大到小做了五项，对外协议（`/proc` 命令、配置格式、WebUI 行为）不变。
+
+### 11.1 符号解析缓存
+
+`lkm_resolve()` 原来对每个未定义符号都跑一次三级查找，而 kallsyms 查询本质是十万级名字的线性扫描，
+几百个符号的 ko 就是上千万次字符串比较。现在用一个 509 槽的开放寻址表缓存 `name → addr`：
+
+- **只缓存命中**：查不到的名字每次都重试，因为提供者可能是稍后才加载的另一个模块；
+- 表满时静默跳过，不影响正确性；名字超过 47 字节不缓存，避免截断后误命中；
+- `flush` 命令清空缓存，脚本在 `rmmod` 成功后自动发一次，防止拿到已卸载模块的地址。
+
+`/proc/lkmctl` 新增 `cache_used` / `cache_hits` / `cache_misses`，设置页也会显示，便于判断命中率。
+实测口径：同一 ko 重载、或多个 ko 共享符号时才明显受益；单次冷加载的收益来自省掉重复查找。
+
+### 11.2 `__versions` 查表改成哈希
+
+`lkm_versions_has()` 原来对每个符号线性扫一遍版本表。现在加载镜像时按 FNV-1a 建索引
+（2 的幂大小，`kvcalloc`），命中 O(1)；分配失败自动退回线性扫描，行为不变。
+索引在 patch 结束时 `kvfree`，不占常驻内存。
+
+### 11.3 `/proc/lkmctl` 读路径去掉 kmalloc
+
+状态行是固定的，改成 1.8 KB 静态缓冲区，在 `lkm_lock` 内填充后直接 `simple_read_from_buffer()`。
+原先每次 `cat` 都要一次 `kmalloc(1536)`，而 WebUI 会周期性读取这个文件。
+
+### 11.4 WebUI 轮询先比 `seq`
+
+每个 tick 只读一次 `/proc/lkmctl`；`seq` 没变就只更新计数，不重新拉日志、不重建 DOM。
+原来每 8 秒把日志区整体重建一次，是 WebView 里最明显的周期性开销。
+
+### 11.5 CI 矩阵化
+
+见 §6 最后一段。
+
+---
+
+## 12. 参考
 
 - [KallRecon](https://github.com/Dere3046/KallRecon) — kallsyms 重建（`doc/API.md` 是主要依据）
 - [KMSDK](https://github.com/Dere3046/KMSDK) — `deps.lst` / `.sdk-version` / `scripts/sdk` 约定
