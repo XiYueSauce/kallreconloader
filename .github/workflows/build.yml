@@ -1,0 +1,60 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  TARGETS: >-
+    android12-5.10
+    android13-5.10
+    android13-5.15
+    android14-6.1
+    android15-6.6
+    android16-6.12
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: deploy deps (KMSDK + KallRecon)
+        run: |
+          chmod +x scripts/*.sh build-all.sh
+          ./scripts/fetch-deps.sh
+
+      - name: static checks
+        run: ./scripts/check.sh
+
+      - name: install ddk
+        run: |
+          sudo curl -fsSL https://raw.githubusercontent.com/Ylarod/ddk/main/scripts/ddk -o /usr/local/bin/ddk
+          sudo chmod +x /usr/local/bin/ddk
+
+      - name: build every target
+        run: |
+          set -e
+          for t in $TARGETS; do
+            echo "::group::build $t"
+            ddk pull "$t"
+            ddk build --target "$t"
+            test -f "out/$t/lkmloader.ko"
+            echo "::endgroup::"
+          done
+
+      - name: package module zip
+        run: TARGETS="$TARGETS" ./scripts/package.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lkmloader-module
+          path: dist/*.zip
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: dist/*.zip

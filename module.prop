@@ -1,0 +1,6 @@
+id=lkmloader
+name=LKM Loader
+version=v1.1.0
+versionCode=10100
+author=lkmloader
+description=Load kernel modules (.ko) that reference non-exported symbols. kallsyms reconstructed with KallRecon, driven from a WebUI. KernelSU / APatch / Magisk compatible, per-module load timing (post-fs-data or service).

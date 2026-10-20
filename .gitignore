@@ -1,0 +1,14 @@
+out/
+build/
+dist/
+deps/
+.sdk/
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/

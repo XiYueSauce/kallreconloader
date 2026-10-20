@@ -1,0 +1,6 @@
+# scripts run on Android: never check them out with CRLF
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ko binary
+*.zip binary

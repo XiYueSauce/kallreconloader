@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>LKM Loader</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="app">
+  <header class="topbar">
+    <div class="title-wrap">
+      <h1>LKM Loader</h1>
+      <p class="sub"><span id="ui-version">v1.1.0</span> · <span id="ui-id">lkmloader</span> · <span id="ui-manager">…</span></p>
+    </div>
+  </header>
+
+  <div class="banner" id="demo-banner" hidden>
+    演示模式：未检测到 Root 管理器桥接，界面显示的是示例数据。
+  </div>
+
+  <main class="views">
+
+    <!-- ---------------------------------------------------------- status -->
+    <section class="view" id="view-status">
+      <div class="card">
+        <div class="row">
+          <span class="k">lkmloader</span>
+          <span class="pill" id="st-loader">检测中</span>
+        </div>
+        <div class="row">
+          <span class="k">内核</span>
+          <span class="v num" id="st-kernel">—</span>
+        </div>
+        <div class="row">
+          <span class="k">构建 KMI</span>
+          <span class="v" id="st-kmi">—</span>
+        </div>
+        <div class="row">
+          <span class="k">设备</span>
+          <span class="v" id="st-device">—</span>
+        </div>
+        <div class="row">
+          <span class="k">平台</span>
+          <span class="v" id="st-soc">—</span>
+        </div>
+        <div class="row">
+          <span class="k">Vermagic 匹配</span>
+          <span class="pill" id="st-compat">—</span>
+        </div>
+        <div class="row">
+          <span class="k">加载阻断</span>
+          <span class="pill" id="st-blocked">—</span>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn" id="btn-refresh">刷新</button>
+        <button class="btn primary" id="btn-reload">重新加载</button>
+        <button class="btn" id="btn-clear">清空日志</button>
+      </div>
+
+      <h2 class="section-title">参数</h2>
+      <div class="card pad mono params" id="st-params">—</div>
+
+      <h2 class="section-title">日志</h2>
+      <div class="card pad mono logs" id="st-logs"><p class="muted">暂无日志</p></div>
+    </section>
+
+    <!-- --------------------------------------------------------- modules -->
+    <section class="view" id="view-modules" hidden>
+      <div class="view-head">
+        <div>
+          <h2 class="view-title">模块</h2>
+          <p class="hint" id="mod-count">—</p>
+        </div>
+        <button class="btn small primary" id="btn-import">导入 .ko</button>
+      </div>
+
+      <div id="mod-list"></div>
+
+      <div class="empty" id="mod-empty" hidden>
+        <p>还没有导入任何模块</p>
+        <p class="muted small">点击右上角「导入 .ko」，从设备目录里选择内核模块</p>
+      </div>
+
+      <h2 class="section-title">说明</h2>
+      <div class="card pad">
+        <p class="note">导入的 .ko 会复制到模块目录的 <code>lkm/</code> 下，开机时按各自的时机加载。
+        非导出符号由内核侧 loader 用 kallsyms 重建后逐个回填。</p>
+      </div>
+    </section>
+
+    <!-- -------------------------------------------------------- settings -->
+    <section class="view" id="view-settings" hidden>
+      <h2 class="section-title first">加载时机</h2>
+      <div class="card">
+        <div class="row col">
+          <span class="k">新导入模块默认</span>
+          <div class="segmented" id="st-default-stage">
+            <button data-stage="post-fs-data">post-fs-data</button>
+            <button data-stage="service">service</button>
+            <button data-stage="manual">手动</button>
+          </div>
+        </div>
+        <div class="row"><span class="k">post-fs-data</span><span class="v small">/data 挂载后，system_server 之前</span></div>
+        <div class="row"><span class="k">service</span><span class="v small">late_start service，系统服务就绪</span></div>
+      </div>
+
+      <h2 class="section-title">加载选项</h2>
+      <div class="card">
+        <div class="row">
+          <div class="k-block"><span class="k">忽略 vermagic</span><p class="desc">内核版本串不匹配时仍尝试加载</p></div>
+          <label class="switch"><input type="checkbox" id="opt-vermagic"><i></i></label>
+        </div>
+        <div class="row">
+          <div class="k-block"><span class="k">忽略 modversions</span><p class="desc">跳过符号 CRC 校验，跨版本 ko 有崩溃风险</p></div>
+          <label class="switch"><input type="checkbox" id="opt-modversions"><i></i></label>
+        </div>
+        <div class="row">
+          <div class="k-block"><span class="k">严格符号</span><p class="desc">有符号无法解析时直接放弃加载</p></div>
+          <label class="switch"><input type="checkbox" id="opt-strict"><i></i></label>
+        </div>
+        <div class="row">
+          <div class="k-block"><span class="k">详细日志</span><p class="desc">逐个打印被回填的符号</p></div>
+          <label class="switch"><input type="checkbox" id="opt-verbose"><i></i></label>
+        </div>
+        <div class="row">
+          <div class="k-block"><span class="k">仅回填非导出符号</span><p class="desc">已导出的符号交给内核自己解析，保留 CRC 校验</p></div>
+          <label class="switch"><input type="checkbox" id="opt-keep"><i></i></label>
+        </div>
+      </div>
+
+      <h2 class="section-title">loader</h2>
+      <div class="card">
+        <div class="row"><span class="k">内核符号</span><span class="v num" id="set-syms">—</span></div>
+        <div class="row"><span class="k">kallsyms 布局</span><span class="v" id="set-layout">—</span></div>
+        <div class="row"><span class="k">符号策略</span><span class="v" id="set-mode">—</span></div>
+        <div class="row"><span class="k">加载 / 失败</span><span class="v num" id="set-counts">—</span></div>
+        <div class="row btn-row">
+          <button class="btn" id="btn-restart-loader">重启 loader</button>
+        </div>
+      </div>
+
+      <h2 class="section-title">关于</h2>
+      <div class="card">
+        <div class="row"><span class="k">版本</span><span class="v" id="about-version">—</span></div>
+        <div class="row"><span class="k">模块 ID</span><span class="v" id="about-id">lkmloader</span></div>
+        <div class="row"><span class="k">管理器</span><span class="v" id="about-manager">—</span></div>
+        <div class="row"><span class="k">Android</span><span class="v" id="about-android">—</span></div>
+        <div class="row"><span class="k">符号来源</span><span class="v">KallRecon</span></div>
+        <div class="row"><span class="k">加载方式</span><span class="v">load_module + ELF patch</span></div>
+      </div>
+      <p class="footnote">KallRecon · KMSDK · lkmloader.ko</p>
+    </section>
+
+  </main>
+
+  <nav class="tabbar">
+    <button class="tab active" data-view="status">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h5l2 5 3-12 2 7h4"/></svg>
+      <span>状态</span>
+    </button>
+    <button class="tab" data-view="modules">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="2"/><rect x="13" y="4" width="7" height="7" rx="2"/><rect x="4" y="13" width="7" height="7" rx="2"/><rect x="13" y="13" width="7" height="7" rx="2"/></svg>
+      <span>模块</span>
+    </button>
+    <button class="tab" data-view="settings">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M12 3.5v2.2M12 18.3v2.2M4.6 12H2.4M21.6 12h-2.2M6.8 6.8 5.2 5.2M18.8 18.8l-1.6-1.6M6.8 17.2l-1.6 1.6M18.8 5.2l-1.6 1.6"/></svg>
+      <span>设置</span>
+    </button>
+  </nav>
+</div>
+
+<!-- ------------------------------------------------------- file picker sheet -->
+<div class="sheet-wrap" id="sheet" hidden>
+  <div class="sheet-mask" id="sheet-mask"></div>
+  <div class="sheet" role="dialog" aria-modal="true" aria-label="选择 .ko 文件">
+    <div class="sheet-grip"></div>
+    <div class="sheet-head">
+      <h3>选择 .ko 文件</h3>
+      <button class="icon-btn" id="sheet-close" aria-label="关闭">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+
+    <div class="crumb">
+      <button class="icon-btn" id="crumb-up" aria-label="上级目录">
+        <svg viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+      </button>
+      <span id="crumb-path">/sdcard/Download</span>
+    </div>
+
+    <div class="quick" id="quick-jumps">
+      <button data-path="/sdcard/Download">Download</button>
+      <button data-path="/sdcard">内部存储</button>
+      <button data-path="/data/local/tmp">local/tmp</button>
+      <button data-path="/data/adb/modules">modules</button>
+    </div>
+
+    <div class="filter-row">
+      <label class="switch small"><input type="checkbox" id="only-ko" checked><i></i></label>
+      <span>仅显示 .ko</span>
+      <span class="spacer"></span>
+      <button class="link" id="pick-manual">手动输入路径</button>
+    </div>
+
+    <div class="filelist" id="filelist"></div>
+
+    <div class="sheet-foot">
+      <button class="btn" id="pick-cancel">取消</button>
+      <button class="btn primary" id="pick-confirm" disabled>导入</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<!-- ------------------------------------------------------ module detail sheet -->
+<div class="sheet-wrap" id="sheet-module" hidden>
+  <div class="sheet-mask" id="md-mask"></div>
+  <div class="sheet" role="dialog" aria-modal="true" aria-label="模块详情">
+    <div class="sheet-grip"></div>
+    <div class="sheet-head">
+      <h3 id="md-title">模块</h3>
+      <button class="icon-btn" id="md-close" aria-label="关闭">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="card flat" id="md-info"></div>
+    <div class="md-form">
+      <label class="field">
+        <span>加载参数</span>
+        <input id="md-args" type="text" placeholder="key=value，多个用空格分隔" autocapitalize="off" autocorrect="off" spellcheck="false">
+      </label>
+      <div class="field">
+        <span>加载时机</span>
+        <div class="segmented" id="md-stage">
+          <button data-stage="post-fs-data">post-fs-data</button>
+          <button data-stage="service">service</button>
+          <button data-stage="manual">手动</button>
+        </div>
+      </div>
+    </div>
+    <div class="sheet-foot three">
+      <button class="btn" id="md-delete">删除</button>
+      <button class="btn" id="md-toggle">卸载</button>
+      <button class="btn primary" id="md-reload">重载</button>
+    </div>
+  </div>
+</div>
+
+<script src="js/shell.js"></script>
+<script src="js/lkm.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

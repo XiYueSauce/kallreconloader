@@ -1,0 +1,77 @@
+#!/sbin/sh
+#
+# module installer entry point
+# Magisk / KernelSU / APatch all extract the zip into $MODPATH before calling
+# this script; if that did not happen we do it ourselves so the zip also
+# installs from a bare shell.
+#
+
+umask 022
+OUTFD=$2
+ZIPFILE=$3
+
+case $OUTFD in
+''|*[!0-9]*) OUTFD=0 ;;
+esac
+
+BUSYBOX=""
+for bb in /data/adb/ksu/bin/busybox /data/adb/ap/bin/busybox \
+	/data/adb/magisk/busybox /system/bin/busybox /sbin/busybox; do
+	if [ -x "$bb" ]; then
+		BUSYBOX=$bb
+		break
+	fi
+done
+
+ui_print() {
+	if [ -n "$OUTFD" ] && [ "$OUTFD" != "0" ]; then
+		printf 'ui_print %s\nui_print\n' "$1" >&$OUTFD 2>/dev/null
+	else
+		echo "$1"
+	fi
+}
+
+unzip_to() {
+	if [ -n "$BUSYBOX" ]; then
+		$BUSYBOX unzip -o "$ZIPFILE" -d "$1" >/dev/null 2>&1 && return 0
+	fi
+	unzip -o "$ZIPFILE" -d "$1" >/dev/null 2>&1 && return 0
+	return 1
+}
+
+if [ -z "$MODPATH" ] || [ ! -f "$MODPATH/module.prop" ]; then
+	if [ -z "$ZIPFILE" ] || [ ! -f "$ZIPFILE" ]; then
+		ui_print "! no zip to install"
+		exit 1
+	fi
+	MODPATH=/dev/tmp/lkmloader_install
+	rm -rf "$MODPATH"
+	mkdir -p "$MODPATH"
+	if ! unzip_to "$MODPATH"; then
+		ui_print "! cannot extract the zip (no unzip available)"
+		exit 1
+	fi
+	MODID=$(sed -n 's/^id=//p' "$MODPATH/module.prop")
+	[ -n "$MODID" ] || MODID=lkmloader
+	if [ -d /data/adb/modules ] && [ -w /data/adb/modules ]; then
+		TARGET=/data/adb/modules/$MODID
+		mkdir -p "$TARGET"
+		if [ -n "$BUSYBOX" ]; then
+			$BUSYBOX cp -af "$MODPATH"/. "$TARGET"/
+		else
+			cp -af "$MODPATH"/. "$TARGET"/
+		fi
+		MODPATH=$TARGET
+	fi
+fi
+
+export MODPATH
+
+if [ ! -f "$MODPATH/customize.sh" ]; then
+	ui_print "! customize.sh missing from the package"
+	exit 1
+fi
+
+sh "$MODPATH/customize.sh"
+
+exit 0
