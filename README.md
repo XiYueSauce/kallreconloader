@@ -79,7 +79,7 @@ make KDIR=/opt/ddk/kdir/android16-6.12                     # VER 按目录名推
 ./build-all.sh
 
 # 5. 打包（每个 ko 都会校验 ELF/ET_REL/vermagic，并回读 zip 内容）
-./scripts/package.sh     # -> dist/lkmloader-v1.2.7.zip
+./scripts/package.sh     # -> dist/lkmloader-v1.2.8.zip
 ```
 
 CI 见 `.github/workflows/build.yml`，用 docker 版 ddk 逐个 target 构建后打包。
@@ -128,6 +128,11 @@ loader 是否加载以 `/proc/lkmctl` 为准，读不到时回退看 `/proc/modu
 
 已加载列表只看内核当前状态，不去扫描 `/data/adb/modules`、Download 这类目录——
 文件在那儿不等于已经加载，扫盘还慢。
+
+文件被改名（`mhsrc.ko` → `mhsrc (1).ko`、`mhsrc - 副本.ko` 之类）不影响判定：内核用的是加载时的
+文件名，所以加载成功时会把真实模块名记进 `config.json` 的 `loadedAs`；没有记录的历史条目则按
+去掉 `(1)` / `_1_` / 末尾下划线的名字再匹配一次。命中别名时卡片直接显示内核名（`已加载 mhsrc`），
+卸载也按这个名字走，不会出现"看着已加载、点卸载说没加载"的情况。
 
 ## 内核侧接口
 

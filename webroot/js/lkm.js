@@ -52,6 +52,24 @@
       .replace(/[^A-Za-z0-9_]/g, '_');
   }
 
+  /*
+   * A renamed file is the same module: file managers add " (1)", " - copy",
+   * "_1" and so on, and the kernel keeps the name it was loaded under. Strip
+   * those decorations so an entry can still be matched to its module.
+   */
+  function cleanName(name) {
+    var k = kernelName(name);
+    var prev = '';
+    while (k && k !== prev) {
+      prev = k;
+      k = k
+        .replace(/\s*\(\d+\)$/, '')          /* module (1) */
+        .replace(/[_\-.]{1,2}\d+$/, '')       /* module_1 / module__1 / module-1 */
+        .replace(/_+$/, '');
+    }
+    return k || kernelName(name);
+  }
+
   function baseName(path) {
     return String(path || '').split('/').pop();
   }
@@ -139,7 +157,9 @@
         ',"args":' + JSON.stringify(m.args || '') +
         ',"stage":' + JSON.stringify(m.stage || 'service') +
         ',"enabled":' + (m.enabled === false ? 'false' : 'true') +
-        ',"delay":' + (parseInt(m.delay, 10) || 0) + '}';
+        ',"delay":' + (parseInt(m.delay, 10) || 0) +
+        (m.loadedAs ? ',"loadedAs":' + JSON.stringify(m.loadedAs) : '') +
+        '}';
     });
     return [
       '{',
@@ -386,9 +406,12 @@
 
     var want = [];
     entries.forEach(function (m) {
-      nameVariants(m.name).forEach(function (v) {
-        if (want.indexOf(v) < 0) want.push(v);
-      });
+      nameVariants(m.name)
+        .concat(m.loadedAs ? nameVariants(m.loadedAs) : [])
+        .concat(nameVariants(cleanName(m.loadedAs || m.name)))
+        .forEach(function (v) {
+          if (v && want.indexOf(v) < 0) want.push(v);
+        });
     });
 
     var script = 'awk -v want=' + q(want.join(' ')) + ' \'BEGIN{' +
@@ -442,19 +465,51 @@
     delete state.vermagic[path];
   }
 
+  /*
+   * Match an entry to a loaded module. Exact names first (config name and the
+   * name recorded at load time), then one cleaned-name pass. The fallback
+   * refuses a name another entry already owns, so two builds of the same
+   * module cannot both claim one loaded instance.
+   */
+  function matchLoaded(entry, set, owners) {
+    var exact = nameVariants(entry.name);
+    if (entry.loadedAs) exact = exact.concat(nameVariants(entry.loadedAs));
+
+    for (var i = 0; i < exact.length; i++) {
+      if (set[exact[i]]) return { name: exact[i], alias: false };
+    }
+
+    var cands = nameVariants(cleanName(entry.loadedAs || entry.name));
+    for (var j = 0; j < cands.length; j++) {
+      if (!set[cands[j]]) continue;
+      if (owners[cands[j]] && owners[cands[j]] !== entry.name) continue;
+      return { name: cands[j], alias: true };
+    }
+    return null;
+  }
+
   function refreshModules() {
     return loadConfig().then(function (cfg) {
       var entries = moduleEntries(cfg);
+      var owners = {};
+      entries.forEach(function (m) {
+        nameVariants(m.name)
+          .concat(m.loadedAs ? nameVariants(m.loadedAs) : [])
+          .forEach(function (v) { owners[v] = m.name; });
+      });
+
       return loadVermagic(entries).then(function () {
         return loadedSet(entries);
       }).then(function (set) {
         return global.Shell.deviceInfo().catch(function () { return {}; }).then(function (info) {
           var kmi = kmiFromKernel(info.kernel);
           return entries.map(function (m) {
-            var loaded = nameVariants(m.name).some(function (v) { return !!set[v]; });
+            var hit = matchLoaded(m, set, owners);
             var vm = state.vermagic[m.path] || '';
             return Object.assign({}, m, {
-              loaded: loaded,
+              loaded: !!hit,
+              loadedName: hit ? hit.name : '',
+              loadedAlias: hit ? hit.alias : false,
               vermagic: vm,
               _compatible: parseVermagic(vm, info.kernel, kmi)
             });
@@ -479,16 +534,45 @@
     ].join('\n');
   }
 
+  /*
+   * The kernel names a module after the file it was handed, so record that name
+   * on a successful load: renaming the file afterwards must not make the entry
+   * look unloaded, and the next boot loads it under the new file name.
+   */
+  function noteLoaded(m) {
+    var actual = kernelName(baseName(m.path));
+    if (!actual) return Promise.resolve();
+
+    var hot = state.hot.filter(function (h) {
+      return h.path === m.path || kernelName(h.name) === kernelName(m.name);
+    })[0];
+    if (hot) {
+      hot.loadedAs = actual;
+      return Promise.resolve();
+    }
+
+    return loadConfig().then(function (cfg) {
+      var e = cfg.modules.filter(function (x) { return x.name === m.name; })[0];
+      if (!e || e.loadedAs === actual) return null;
+      e.loadedAs = actual;
+      return saveConfig(cfg);
+    }).catch(function () { return null; });
+  }
+
   function loadOne(m) {
     return run(loaderScript(
       'lkm_load_one ' + q(m.name) + ' ' + q(m.path) + ' ' + q(sanitizeArgs(m.args))
     )).then(function (r) {
-      return { ok: r.code === 0, out: (r.out || '').trim(), err: (r.err || '').trim() };
+      var res = { ok: r.code === 0, out: (r.out || '').trim(), err: (r.err || '').trim() };
+      if (!res.ok) return res;
+      return noteLoaded(m).then(function () { return res; });
     });
   }
 
   function unloadOne(m) {
-    return run(loaderScript('lkm_unload_one ' + q(m.name))).then(function (r) {
+    /* a renamed entry carries the kernel name it was matched by */
+    var target = m.loadedName || m.name;
+    return run(loaderScript('lkm_unload_one ' + q(target))).then(function (r) {
       var out = (r.out || '').trim();
       var m2 = out.match(/state=(\w+)(?::([\s\S]*))?/);
       var st = m2 ? m2[1] : 'failed';
@@ -519,8 +603,9 @@
         if (exist) {
           exist.args = sanitizeArgs(args);
           exist.name = name;
+          exist.loadedAs = name;
         } else {
-          state.hot.push({ name: name, path: path, args: sanitizeArgs(args) });
+          state.hot.push({ name: name, path: path, args: sanitizeArgs(args), loadedAs: name });
         }
         forgetVermagic(path);
       }
@@ -717,8 +802,8 @@
           var ok = r.code === 0;
           if (ok) {
             var exist = state.hot.filter(function (h) { return h.path === up.path; })[0];
-            if (exist) exist.name = name;
-            else state.hot.push({ name: name, path: up.path, args: '' });
+            if (exist) { exist.name = name; exist.loadedAs = name; }
+            else state.hot.push({ name: name, path: up.path, args: '', loadedAs: name });
           }
           return { ok: ok, name: name, path: up.path, out: out, err: err || (ok ? '' : out) };
         });
@@ -881,7 +966,7 @@
     });
   }
 
-  function removeModule(name) {
+  function removeModule(name, loadedName) {
     return loadConfig().then(function (cfg) {
       var target = cfg.modules.filter(function (m) { return m.name === name; })[0];
       cfg.modules = cfg.modules.filter(function (m) { return m.name !== name; });
@@ -890,7 +975,10 @@
         /* only files the module itself copied may be deleted; a hot loaded
            module still lives wherever the user picked it */
         var owned = target.path && target.path.indexOf(state.modDir + '/') === 0;
-        var unload = nameVariants(target.name).map(function (n) {
+        var names = nameVariants(target.name);
+        if (loadedName) names = names.concat(nameVariants(loadedName));
+        if (target.loadedAs) names = names.concat(nameVariants(target.loadedAs));
+        var unload = names.map(function (n) {
           return 'grep -q "^' + n + ' " /proc/modules 2>/dev/null && rmmod ' + q(n) + ' 2>/dev/null';
         }).join('\n');
         var lines = [unload];
@@ -986,7 +1074,7 @@
           manager: 'KernelSU', uid: '0', blocked: false,
           symbols: 142103, layout: '2', loads: 1, fails: 0, seq: 7,
           cacheUsed: 38, cacheHits: 12,
-          symbolMode: 0, loaderVersion: '1.2.7', lastTarget: 'droid_lkm.ko',
+          symbolMode: 0, loaderVersion: '1.2.8', lastTarget: 'droid_lkm.ko',
           lastPatched: 11, lastNative: 6,
           lastErrno: '0', lastMsg: 'loaded droid_lkm.ko (patched 11, native 6)'
         });
@@ -999,7 +1087,7 @@
       },
       ctl: function () {
         return Promise.resolve({
-          loader: 'lkmloader', version: '1.2.7', num_syms: '142103',
+          loader: 'lkmloader', version: '1.2.8', num_syms: '142103',
           layout: '2', seq: '7', loads: '1', fails: '0', symbol_mode: '0',
           cache_used: '38', cache_hits: '12', cache_misses: '94',
           last_target: 'droid_lkm.ko', last_patched: '11', last_native: '6',
@@ -1033,7 +1121,7 @@
       },
       loadedModules: function () { return Promise.resolve(demoLoaded.slice()); },
       restartLoader: function () {
-        return Promise.resolve({ ok: true, up: true, syms: 142103, version: '1.2.7', mode: '0', out: 'state=up' });
+        return Promise.resolve({ ok: true, up: true, syms: 142103, version: '1.2.8', mode: '0', out: 'state=up' });
       },
       clearLog: function () { demoLogs.loader = ''; return Promise.resolve(); },
       sanitizeArgs: sanitizeArgs,
@@ -1057,7 +1145,7 @@
         });
       },
       meta: function () {
-        return Promise.resolve({ id: 'lkmloader', version: 'v1.2.7', name: 'LKM Loader' });
+        return Promise.resolve({ id: 'lkmloader', version: 'v1.2.8', name: 'LKM Loader' });
       },
       importBlob: function (file) {
         return Promise.resolve({ name: sanitizeName(file && file.name), path: '/lkm', replaced: false, size: 1 });
@@ -1115,8 +1203,8 @@
     updateModule: function (name, patch) {
       return loadConfig().then(function () { return updateModule(name, patch); });
     },
-    removeModule: function (name) {
-      return loadConfig().then(function () { return removeModule(name); });
+    removeModule: function (name, loadedName) {
+      return loadConfig().then(function () { return removeModule(name, loadedName); });
     },
     saveOptions: function (patch) {
       return loadConfig().then(function () { return saveOptions(patch); });

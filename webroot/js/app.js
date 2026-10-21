@@ -341,7 +341,12 @@
       name.style.fontWeight = '600';
       name.textContent = m.name + '.ko';
       head.appendChild(name);
-      head.appendChild(m.loaded ? pill('已加载', 'ok') : pill('未加载'));
+      var statePill = m.loaded ? pill('已加载', 'ok') : pill('未加载');
+      if (m.loaded && m.loadedName && m.loadedName !== LKM.kernelName(m.name)) {
+        statePill.title = '内核里的模块名：' + m.loadedName;
+        statePill.textContent = '已加载 ' + m.loadedName;
+      }
+      head.appendChild(statePill);
       card.appendChild(head);
 
       var pathRow = document.createElement('div');
@@ -456,7 +461,11 @@
 
     var info = $('#md-info');
     info.textContent = '';
-    info.appendChild(row('状态', m.loaded ? '已加载' : '未加载'));
+    var status = m.loaded ? '已加载' : '未加载';
+    if (m.loaded && m.loadedName && m.loadedName !== LKM.kernelName(m.name)) {
+      status += '（内核名 ' + m.loadedName + '）';
+    }
+    info.appendChild(row('状态', status));
     info.appendChild(row('路径', m.path, 'num'));
     info.appendChild(row('Vermagic', m.vermagic || '未找到', 'num small'));
     info.appendChild(row('静态匹配', m._compatible === null || m._compatible === undefined
@@ -568,6 +577,7 @@
     var set = {};
     state.modules.forEach(function (m) {
       set[LKM.kernelName(m.name)] = true;
+      if (m.loadedAs) set[m.loadedAs] = true;
     });
     return set;
   }
@@ -872,7 +882,7 @@
         : '把 ' + m.name + ' 从开机列表移除？原文件（' + m.path + '）会保留。')) return;
 
       guard(function () {
-        return LKM.removeModule(m.name).then(function (r) {
+        return LKM.removeModule(m.name, m.loadedName).then(function (r) {
           toast(r && r.removedFile ? '已删除 ' + m.name : '已移除 ' + m.name + '（原文件保留）');
           closeModuleSheet();
           return Promise.all([refreshModules(), refreshStatus()]);

@@ -234,6 +234,79 @@ test('importBlob uploads in chunks and verifies the size', async () => {
   assert.strictEqual(joined, b64, 'the appends must reproduce the file byte for byte');
 });
 
+/* ------------------------------------------------ renamed / recorded names */
+
+function bridgeWith(cfg, mods, sink) {
+  const win = {
+    ksu: {
+      exec(cmd) {
+        if (sink) sink.push(cmd);
+        let out = '';
+        if (cmd.indexOf('config.json') >= 0) out = cfg;
+        else if (cmd.indexOf('module.prop') >= 0) out = '/data/adb/modules/lkmloader\n';
+        else if (cmd.indexOf('/proc/modules') >= 0) {
+          /* the real awk prints the matching names only, one per line */
+          out = mods.join('\n') + (mods.length ? '\n' : '');
+        }
+        return Promise.resolve({ errno: 0, stdout: out, stderr: '' });
+      }
+    }
+  };
+  loadLkm(win);
+  return win;
+}
+
+function configWith(list) {
+  return JSON.stringify({
+    version: 1,
+    defaultStage: 'service',
+    options: { ignoreVermagic: false, ignoreModversions: false, strictSymbols: true, verbose: true, keepExported: true },
+    modules: list
+  });
+}
+
+const entry = (name, extra) => Object.assign({
+  name: name,
+  path: '/data/adb/modules/lkmloader/lkm/' + name + '.ko',
+  args: '',
+  stage: 'service',
+  enabled: true,
+  delay: 0
+}, extra || {});
+
+test('a renamed .ko still matches its loaded module', async () => {
+  const sink = [];
+  const win = bridgeWith(configWith([entry('mhsrc__1_')]), ['mhsrc'], sink);
+  const mods = await win.LKM.real.modules();
+
+  assert.strictEqual(mods.length, 1);
+  assert.strictEqual(mods[0].loaded, true, 'mhsrc (1).ko is the loaded mhsrc');
+  assert.strictEqual(mods[0].loadedName, 'mhsrc');
+  assert.strictEqual(mods[0].loadedAlias, true);
+
+  const awk = sink.filter((c) => c.indexOf('-v want=') > 0)[0] || '';
+  assert.ok(/\bmhsrc\b/.test(awk), 'the awk want list must include the cleaned name');
+});
+
+test('the cleaned-name fallback yields to an entry that owns the name', async () => {
+  const win = bridgeWith(configWith([entry('foo'), entry('foo__1_')]), ['foo']);
+  const mods = await win.LKM.real.modules();
+  const byName = {};
+  mods.forEach((m) => { byName[m.name] = m; });
+
+  assert.strictEqual(byName.foo.loaded, true);
+  assert.strictEqual(byName.foo__1_.loaded, false, 'the second entry must not steal foo');
+});
+
+test('a recorded kernel name keeps matching after a rename', async () => {
+  const win = bridgeWith(configWith([entry('renamed', { loadedAs: 'mhsrc' })]), ['mhsrc']);
+  const mods = await win.LKM.real.modules();
+
+  assert.strictEqual(mods[0].loaded, true);
+  assert.strictEqual(mods[0].loadedName, 'mhsrc');
+  assert.strictEqual(mods[0].loadedAlias, false, 'exact match through loadedAs');
+});
+
 test('every generated shell snippet parses', async () => {
   const recorded = [];
   const win = {
