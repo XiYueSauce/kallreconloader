@@ -986,7 +986,7 @@
           manager: 'KernelSU', uid: '0', blocked: false,
           symbols: 142103, layout: '2', loads: 1, fails: 0, seq: 7,
           cacheUsed: 38, cacheHits: 12,
-          symbolMode: 0, loaderVersion: '1.2.6', lastTarget: 'droid_lkm.ko',
+          symbolMode: 0, loaderVersion: '1.2.7', lastTarget: 'droid_lkm.ko',
           lastPatched: 11, lastNative: 6,
           lastErrno: '0', lastMsg: 'loaded droid_lkm.ko (patched 11, native 6)'
         });
@@ -999,7 +999,7 @@
       },
       ctl: function () {
         return Promise.resolve({
-          loader: 'lkmloader', version: '1.2.6', num_syms: '142103',
+          loader: 'lkmloader', version: '1.2.7', num_syms: '142103',
           layout: '2', seq: '7', loads: '1', fails: '0', symbol_mode: '0',
           cache_used: '38', cache_hits: '12', cache_misses: '94',
           last_target: 'droid_lkm.ko', last_patched: '11', last_native: '6',
@@ -1033,7 +1033,7 @@
       },
       loadedModules: function () { return Promise.resolve(demoLoaded.slice()); },
       restartLoader: function () {
-        return Promise.resolve({ ok: true, up: true, syms: 142103, version: '1.2.6', mode: '0', out: 'state=up' });
+        return Promise.resolve({ ok: true, up: true, syms: 142103, version: '1.2.7', mode: '0', out: 'state=up' });
       },
       clearLog: function () { demoLogs.loader = ''; return Promise.resolve(); },
       sanitizeArgs: sanitizeArgs,
@@ -1057,7 +1057,7 @@
         });
       },
       meta: function () {
-        return Promise.resolve({ id: 'lkmloader', version: 'v1.2.6', name: 'LKM Loader' });
+        return Promise.resolve({ id: 'lkmloader', version: 'v1.2.7', name: 'LKM Loader' });
       },
       importBlob: function (file) {
         return Promise.resolve({ name: sanitizeName(file && file.name), path: '/lkm', replaced: false, size: 1 });

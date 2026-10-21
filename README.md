@@ -79,7 +79,7 @@ make KDIR=/opt/ddk/kdir/android16-6.12                     # VER 按目录名推
 ./build-all.sh
 
 # 5. 打包（每个 ko 都会校验 ELF/ET_REL/vermagic，并回读 zip 内容）
-./scripts/package.sh     # -> dist/lkmloader-v1.2.5.zip
+./scripts/package.sh     # -> dist/lkmloader-v1.2.7.zip
 ```
 
 CI 见 `.github/workflows/build.yml`，用 docker 版 ddk 逐个 target 构建后打包。
