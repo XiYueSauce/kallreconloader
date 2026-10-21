@@ -79,13 +79,30 @@ make KDIR=/opt/ddk/kdir/android16-6.12                     # VER 按目录名推
 ./build-all.sh
 
 # 5. 打包（每个 ko 都会校验 ELF/ET_REL/vermagic，并回读 zip 内容）
-./scripts/package.sh     # -> dist/lkmloader-v1.2.8.zip
+./scripts/package.sh     # -> dist/lkmloader-v1.2.9.zip
 ```
 
 CI 见 `.github/workflows/build.yml`，用 docker 版 ddk 逐个 target 构建后打包。
 
 依赖只用 KallRecon（`deps.lst` 固定 rev，SDK 版本在 `.sdk-version`），可复现。
 要升级：`./.sdk/scripts/sdk update KallRecon`，或直接改 `deps.lst`。
+
+## 安装与更新
+
+刷入 zip 后 KernelSU 默认要重启才生效。本模块请求了**热安装**（`MODULE_HOT_INSTALL_REQUEST`）：
+它不挂载 system、没有 system.prop / initrc / preinit，唯一的运行时状态就是内核里的 loader，而这部分脚本能补。
+
+安装脚本结束后 KernelSU 会替换模块目录，再执行 `hotinstall.sh`：
+
+- 卸载正在跑的旧 loader，insmod 新的 ko，输出新版本与符号数；
+- 新 ko 被内核拒绝时（vermagic 对不上），自动 insmod 安装时留下的上一版
+  （`ko/lkmloader.prev.ko`），不至于把能用的 loader 弄没，原因同时写进 WebUI 的日志卡片；
+- 已经加载的目标 `.ko` 不受影响——loader 只负责把它们送进内核，需要的话在 WebUI 里重载。
+
+更新会保留你已有的 `config.json`、`ko/options` 和 `lkm/*.ko`（安装脚本从旧目录复制）。
+`post-fs-data.sh` / `service.sh` 在热安装时不会执行，下次开机照常。
+
+仍然需要重启的情况：正在安装的是元模块、设备处于安全模式、或热安装请求被拒绝。
 
 ## 使用
 

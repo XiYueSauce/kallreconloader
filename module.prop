@@ -1,6 +1,6 @@
 id=lkmloader
 name=LKM Loader
-version=v1.2.8
-versionCode=10208
+version=v1.2.9
+versionCode=10209
 author=lkmloader
 description=Load .ko with non-exported kernel symbols. KallRecon + WebUI, KernelSU / APatch / Magisk.

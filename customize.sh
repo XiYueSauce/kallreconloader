@@ -79,6 +79,36 @@ done
 
 mkdir -p "$MODPATH/lkm" "$MODPATH/logs"
 
+# -------------------------------------------------- carry over the user data
+# an update unpacks into an empty staging directory, so everything the user
+# created - imported .ko files, config.json, loader parameters - has to be
+# copied from the installed version or it is gone
+OLD_MODDIR=${LKM_OLD_MODDIR:-/data/adb/modules/$LKM_ID}
+if [ -d "$OLD_MODDIR" ] && [ "$OLD_MODDIR" != "$MODPATH" ]; then
+	KEPT=0
+	for f in config.json ko/options; do
+		[ -f "$OLD_MODDIR/$f" ] || continue
+		mkdir -p "$(dirname "$MODPATH/$f")"
+		cp -f "$OLD_MODDIR/$f" "$MODPATH/$f" 2>/dev/null && KEPT=$((KEPT + 1))
+	done
+	if [ -d "$OLD_MODDIR/lkm" ]; then
+		mkdir -p "$MODPATH/lkm"
+		for k in "$OLD_MODDIR"/lkm/*.ko; do
+			[ -f "$k" ] || continue
+			cp -f "$k" "$MODPATH/lkm/" 2>/dev/null && KEPT=$((KEPT + 1))
+		done
+	fi
+	[ "$KEPT" -gt 0 ] && ui_print "- kept      : $KEPT file(s) from the installed version"
+
+	# the running loader is replaced by hotinstall.sh; keep this build so a
+	# refused insmod can be rolled back instead of leaving the kernel bare
+	if [ -f "$OLD_MODDIR/ko/lkmloader.ko" ]; then
+		if cp -f "$OLD_MODDIR/ko/lkmloader.ko" "$MODPATH/ko/lkmloader.prev.ko" 2>/dev/null; then
+			ui_print "- kept      : previous loader as rollback copy"
+		fi
+	fi
+fi
+
 if [ ! -f "$MODPATH/ko/options" ]; then
 	cat >"$MODPATH/ko/options" <<'EOF'
 verbose=1
@@ -102,7 +132,7 @@ EOF
 fi
 
 chmod 0755 "$MODPATH/post-fs-data.sh" "$MODPATH/service.sh" \
-	"$MODPATH/uninstall.sh" "$MODPATH/customize.sh" 2>/dev/null
+	"$MODPATH/uninstall.sh" "$MODPATH/customize.sh" "$MODPATH/hotinstall.sh" 2>/dev/null
 chmod -R 0755 "$MODPATH/common" "$MODPATH/webroot" 2>/dev/null
 chmod 0644 "$MODPATH/ko/lkmloader.ko" "$MODPATH/ko/options" \
 	"$MODPATH/config.json" 2>/dev/null
@@ -137,6 +167,16 @@ if [ -f "$MODPATH/ko/lkmloader.ko" ]; then
 		ui_print "- loader    : self test failed, it will be retried at boot"
 		[ -n "$INSMOD_ERR" ] && ui_print "  $INSMOD_ERR"
 	fi
+fi
+
+# ------------------------------------------------------------- hot install
+# nothing here lives on a mounted partition and the loader is swapped by
+# hotinstall.sh, so the update does not need a reboot. KernelSU only; other
+# managers ignore the two variables and install as usual.
+export MODULE_HOT_INSTALL_REQUEST=true
+export MODULE_HOT_RUN_SCRIPT=hotinstall.sh
+if [ -d /data/adb/ksu ] || [ -d /data/adb/ksud ]; then
+	ui_print "- hot       : applied without reboot, hotinstall.sh restarts the loader"
 fi
 
 ui_print "- done, open the WebUI to import .ko files"

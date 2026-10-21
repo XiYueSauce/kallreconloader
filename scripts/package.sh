@@ -49,7 +49,7 @@ verify_ko() {
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 
-cp module.prop customize.sh post-fs-data.sh service.sh uninstall.sh "$STAGE"/
+cp module.prop customize.sh post-fs-data.sh service.sh uninstall.sh hotinstall.sh "$STAGE"/
 cp -r common webroot "$STAGE"/
 mkdir -p "$STAGE/META-INF/com/google/android"
 cp META-INF/com/google/android/update-binary "$STAGE/META-INF/com/google/android/"
@@ -83,7 +83,7 @@ fi
 [ "$found" -gt 0 ] || die "no lkmloader.ko in out/, run ./build-all.sh first"
 
 chmod 0755 "$STAGE/customize.sh" "$STAGE/post-fs-data.sh" \
-	"$STAGE/service.sh" "$STAGE/uninstall.sh"
+	"$STAGE/service.sh" "$STAGE/uninstall.sh" "$STAGE/hotinstall.sh"
 chmod -R 0755 "$STAGE/common" "$STAGE/webroot"
 
 mkdir -p dist
@@ -129,7 +129,7 @@ PY
 make_zip "$(pwd)/$STAGE" "$(pwd)/dist/$NAME.zip"
 
 # ------------------------------------------------------- verify the zip itself
-need="module.prop customize.sh post-fs-data.sh service.sh uninstall.sh
+need="module.prop customize.sh post-fs-data.sh service.sh uninstall.sh hotinstall.sh
 webroot/index.html webroot/css/style.css webroot/js/app.js webroot/js/lkm.js
 webroot/js/shell.js common/funcs.sh
 META-INF/com/google/android/update-binary META-INF/com/google/android/updater-script"

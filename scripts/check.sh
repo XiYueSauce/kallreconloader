@@ -24,6 +24,7 @@ if command -v node >/dev/null 2>&1; then
 		node --check "$f" || bad "js syntax: $f"
 	done
 	node scripts/test-webui.js || bad "webui tests"
+	bash scripts/test-install.sh || bad "install test"
 else
 	note "node not found, skipping javascript syntax"
 fi
@@ -82,7 +83,7 @@ got=$(LKM_MODDIR="$tmp" sh -c '. ./common/funcs.sh; printf "%s\n" "$(lkm_mod_nam
 [ -z "$got" ] || bad "lkm_mod_name returned something for an unloaded module"
 
 # --------------------------------------------------------------- webui assets
-for f in module.prop customize.sh post-fs-data.sh service.sh uninstall.sh \
+for f in module.prop customize.sh post-fs-data.sh service.sh uninstall.sh hotinstall.sh \
 	META-INF/com/google/android/update-binary \
 	webroot/index.html webroot/css/style.css webroot/js/app.js \
 	webroot/js/lkm.js webroot/js/shell.js common/funcs.sh; do

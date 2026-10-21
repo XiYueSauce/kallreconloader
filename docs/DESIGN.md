@@ -529,9 +529,33 @@ strict 模式下 loader 遇到补不上的符号会直接 abort。这类符号�
 结论：不要为了让它加载而关掉 `strict_symbols`，那只是把 0 当函数指针，退出路径必崩。
 正确做法是在构建端补对象文件，或补齐 `HK_NO_*` 让核心不再调用这些组。
 
+## 13. 热安装
+
+KernelSU 的热安装会替换模块目录、加载 sepolicy.rule、执行 `MODULE_HOT_RUN_SCRIPT`，但**不会**执行
+`post-fs-data.sh` / `service.sh`，也不会处理 system 挂载、system.prop、initrc、preinit。
+本模块恰好不碰这些：它没有 metamodule 挂载，没有 sepolicy.rule，唯一的运行时状态是内核里的 loader，
+而 loader 可以 rmmod + insmod，于是热安装是成立的。
+
+`customize.sh` 结尾导出两个变量：
+
+```sh
+export MODULE_HOT_INSTALL_REQUEST=true
+export MODULE_HOT_RUN_SCRIPT=hotinstall.sh
+```
+
+`hotinstall.sh` 只做一件事——把内核里的 loader 换成新版本：rmmod → `lkm_loader_up` → 失败则回滚。
+安装器最多等 30 s，所以不起服务、不重载目标模块（它们本来就在内核里，loader 只负责装载）。
+回滚依赖安装时留下的 `ko/lkmloader.prev.ko`：更新是解压到空的 staging 目录，不主动备份的话旧 ko 就没了。
+
+顺带修掉一个更早就存在的问题：更新同样会清掉 `config.json`、`lkm/*.ko`、`ko/options`，
+因为 staging 目录是空的。`customize.sh` 现在从 `/data/adb/modules/<id>` 把这些复制过来，
+这也是热安装能放心打开的前提——否则"立即生效"的代价是用户导入的模块当场消失。
+
+`post-fs-data.sh` / `service.sh` 仍在下次开机照常执行；热安装只是让文件和 loader 立刻是新的。
+
 ---
 
-## 13. 参考
+## 14. 参考
 
 - [KallRecon](https://github.com/Dere3046/KallRecon) — kallsyms 重建（`doc/API.md` 是主要依据）
 - [KMSDK](https://github.com/Dere3046/KMSDK) — `deps.lst` / `.sdk-version` / `scripts/sdk` 约定
