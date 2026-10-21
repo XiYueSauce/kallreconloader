@@ -19,6 +19,7 @@ env:
     android14-6.1
     android15-6.6
     android16-6.12
+    android17-6.18
 
 jobs:
   # dependency deploy and static checks run once, before anything is compiled
@@ -50,6 +51,7 @@ jobs:
           - android14-6.1
           - android15-6.6
           - android16-6.12
+          - android17-6.18
     steps:
       - uses: actions/checkout@v4
 
