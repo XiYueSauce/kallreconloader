@@ -324,7 +324,7 @@ Makefile 的两个细节：
 - `deps/KallRecon/deps.mk` 提供 `DEPS_LIB_OBJS`（含 `lib/anchor.o`，锚点汇编按 arch 自选），用 `addprefix` 挂到模块对象里
 - 6.10+ 内核把源文件规则从 `$(src)` 改成 `$(obj)`，因此显式补了 `$(obj)/%.o: $(src)/%.c` 与 `.S` 两条规则（否则 android16-6.12 上找不到源文件）
 
-CI：`.github/workflows/build.yml` 分三段——`check`（依赖部署 + 静态检查）、`build`（7 个 KMI 的矩阵任务并行：5.10 的 12/13、5.15、6.1、6.6、6.12、6.18）、
+CI：`.github/workflows/build.yml` 分三段——`check`（依赖部署 + 静态检查）、`build`（8 个 KMI 的矩阵任务并行：android12/13-5.10、android13-5.15、android14-5.15、android14-6.1、android15-6.6、android16-6.12、android17-6.18）、
 `package`（汇总产物、校验、打包，tag 时发 Release）。矩阵化的收益是失败只影响单个 KMI，
 且总时长等于最慢的单个构建而不是全部之和；`concurrency` 会取消同分支被覆盖的旧运行。
 
