@@ -2,8 +2,16 @@
  * shell.js - root shell bridge + filesystem helpers
  *
  * Works on top of the WebUI API exposed by KernelSU, APatch, KsuWebUI and
- * MMRL. When nothing is available (opened in a normal browser) every call
- * rejects with NO_BRIDGE and the UI falls back to demo data.
+ * MMRL. Two generations of that API exist and both must be supported:
+ *
+ *   promise style   ksu.exec(cmd, opts)              -> Promise<result>
+ *   callback style  ksu.exec(cmd, opts, cbName)      -> nothing
+ *
+ * KernelSU's own WebUI uses the callback form and returns undefined. Treating
+ * that undefined as a result used to make every read look like "empty output",
+ * which is why the UI claimed the loader was not loaded while it was. So the
+ * third argument is always passed, the return value is inspected for a
+ * thenable, and the named global callback is the fallback path.
  */
 (function (global) {
   'use strict';
@@ -18,15 +26,15 @@
   ];
 
   var bridge = null;
-  var TIMEOUT = 30000;
+  var seq = 0;
+  var DEFAULT_TIMEOUT = 20000;
 
   function detect() {
+    bridge = null;
     for (var i = 0; i < CANDIDATES.length; i++) {
-      var name = CANDIDATES[i][0];
-      var key = CANDIDATES[i][1];
-      var api = global[key];
+      var api = global[CANDIDATES[i][1]];
       if (api && typeof api.exec === 'function') {
-        bridge = { name: name, api: api };
+        bridge = { name: CANDIDATES[i][0], api: api };
         return bridge;
       }
     }
@@ -37,37 +45,88 @@
     return "'" + String(value == null ? '' : value).replace(/'/g, "'\\''") + "'";
   }
 
-  function normalize(result) {
-    if (result == null) return { code: 0, out: '', err: '' };
-    if (typeof result === 'string') return { code: 0, out: result, err: '' };
+  function normalize(value) {
+    if (value == null) return { code: 0, out: '', err: '' };
+    if (typeof value === 'string') {
+      /* some bridges hand back the whole result as JSON */
+      if (value.charAt(0) === '{') {
+        try { return normalize(JSON.parse(value)); } catch (e) { /* plain text */ }
+      }
+      return { code: 0, out: value, err: '' };
+    }
     var code = 0;
-    if (result.errno != null) code = Number(result.errno) || 0;
-    else if (result.code != null) code = Number(result.code) || 0;
+    if (value.errno != null) code = Number(value.errno) || 0;
+    else if (value.code != null) code = Number(value.code) || 0;
     return {
       code: code,
-      out: result.stdout != null ? String(result.stdout) : '',
-      err: result.stderr != null ? String(result.stderr) : ''
+      out: value.stdout != null ? String(value.stdout)
+        : (value.out != null ? String(value.out) : ''),
+      err: value.stderr != null ? String(value.stderr)
+        : (value.err != null ? String(value.err) : '')
     };
   }
 
-  function exec(command) {
-    if (!bridge) return Promise.reject(new Error('NO_BRIDGE'));
-    var run;
-    try {
-      run = bridge.api.exec(command);
-    } catch (e) {
-      return Promise.reject(e);
+  /* callback(errno, stdout, stderr) is the documented form; a single result
+     object is accepted too so one code path covers every manager */
+  function fromCallback(args) {
+    if (!args || !args.length) return { code: 0, out: '', err: '' };
+    if (args.length >= 2) {
+      return {
+        code: Number(args[0]) || 0,
+        out: args[1] == null ? '' : String(args[1]),
+        err: args[2] == null ? '' : String(args[2])
+      };
     }
-    return Promise.race([
-      Promise.resolve(run).then(normalize),
-      new Promise(function (_, reject) {
-        setTimeout(function () { reject(new Error('TIMEOUT')); }, TIMEOUT);
-      })
-    ]);
+    return normalize(args[0]);
   }
 
-  function execOk(command) {
-    return exec(command).then(function (res) {
+  function exec(command, options) {
+    if (!bridge) return Promise.reject(new Error('NO_BRIDGE'));
+
+    var opts = options || {};
+    var timeout = opts.timeout || DEFAULT_TIMEOUT;
+
+    return new Promise(function (resolve, reject) {
+      var name = '__lkm_cb_' + (++seq).toString(36) + '_' + Date.now().toString(36);
+      var settled = false;
+      var timer = 0;
+
+      function cleanup() {
+        if (timer) { clearTimeout(timer); timer = 0; }
+        try { delete global[name]; } catch (e) { global[name] = undefined; }
+      }
+      function done(result) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(result);
+      }
+      function fail(err) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      }
+
+      global[name] = function () { done(fromCallback(arguments)); };
+      timer = setTimeout(function () { fail(new Error('TIMEOUT')); }, timeout);
+
+      var ret;
+      try {
+        ret = bridge.api.exec(command, opts.raw || '{}', name);
+      } catch (e) {
+        fail(e);
+        return;
+      }
+      /* promise style managers ignore the extra argument and return a promise */
+      if (ret && typeof ret.then === 'function') {
+        ret.then(function (value) { done(normalize(value)); }, fail);
+      }
+    });
+  }
+
+  function execOk(command, options) {
+    return exec(command, options).then(function (res) {
       return res.out.trim();
     });
   }
@@ -100,44 +159,19 @@
     });
   }
 
-  function listDir(dir) {
-    /* \037 (unit separator) instead of '|': pipes are legal in file names */
-    var script = [
-      'd=' + quote(dir),
-      '[ -d "$d" ] || { echo "!nodir"; exit 0; }',
-      'cd "$d" || { echo "!noperm"; exit 0; }',
-      'for f in * .[!.]*; do',
-      '  [ -e "$f" ] || continue',
-      '  if [ -d "$f" ]; then t=d; else t=f; fi',
-      '  s=$(stat -c %s "$f" 2>/dev/null); [ -n "$s" ] || s=0',
-      "  printf '%s\\037%s\\037%s\\n' \"$t\" \"$s\" \"$f\"",
-      'done'
-    ].join('\n');
+  /* the device never changes under us, so it is fetched once and cached;
+     lkm.js seeds this cache from its own probe to avoid a second shell */
+  var deviceCache = null;
+  var devicePromise = null;
 
-    return exec(script).then(function (res) {
-      var out = res.out;
-      if (out.indexOf('!nodir') >= 0) throw new Error('目录不存在');
-      if (out.indexOf('!noperm') >= 0) throw new Error('没有权限读取该目录');
-      var rows = [];
-      out.split('\n').forEach(function (line) {
-        if (!line) return;
-        var parts = line.split('\u001f');
-        if (parts.length < 3) return;
-        rows.push({
-          type: parts[0] === 'd' ? 'dir' : 'file',
-          size: parseInt(parts[1], 10) || 0,
-          name: parts.slice(2).join('\u001f')
-        });
-      });
-      rows.sort(function (x, y) {
-        if (x.type !== y.type) return x.type === 'dir' ? -1 : 1;
-        return x.name.localeCompare(y.name, 'en', { numeric: true });
-      });
-      return rows;
-    });
+  function setDevice(info) {
+    if (info && info.kernel) deviceCache = info;
   }
 
   function deviceInfo() {
+    if (deviceCache) return Promise.resolve(deviceCache);
+    if (devicePromise) return devicePromise;
+
     var script = [
       'echo "@kernel=$(uname -r 2>/dev/null)"',
       'echo "@model=$(getprop ro.product.model 2>/dev/null)"',
@@ -148,22 +182,28 @@
       'echo "@abi=$(getprop ro.product.cpu.abi 2>/dev/null)"',
       'echo "@selinux=$(getenforce 2>/dev/null)"',
       'echo "@moddis=$(cat /proc/sys/kernel/modules_disabled 2>/dev/null)"',
-      'if [ -d /data/adb/ksu ]; then echo "@manager=KernelSU"; ' +
+      'if [ -d /data/adb/ksu ] || [ -d /data/adb/ksud ]; then echo "@manager=KernelSU"; ' +
         'elif [ -d /data/adb/ap ]; then echo "@manager=APatch"; ' +
         'elif [ -d /data/adb/magisk ]; then echo "@manager=Magisk"; ' +
         'else echo "@manager=Unknown"; fi',
-      'echo "@loader=$(grep -c \'^lkmloader \' /proc/modules 2>/dev/null || echo 0)"',
       'echo "@uid=$(id -u 2>/dev/null)"'
     ].join('\n');
 
-    return exec(script).then(function (res) {
+    devicePromise = exec(script, { timeout: 12000 }).then(function (res) {
       var info = {};
       res.out.split('\n').forEach(function (line) {
         var m = line.match(/^@([a-z0-9]+)=(.*)$/i);
         if (m) info[m[1]] = m[2].trim();
       });
+      deviceCache = info;
+      devicePromise = null;
       return info;
+    }, function (e) {
+      devicePromise = null;
+      throw e;
     });
+
+    return devicePromise;
   }
 
   detect();
@@ -176,8 +216,8 @@
     readFile: readFile,
     writeFile: writeFile,
     exists: exists,
-    listDir: listDir,
     deviceInfo: deviceInfo,
+    setDevice: setDevice,
     q: quote,
     redetect: detect
   };

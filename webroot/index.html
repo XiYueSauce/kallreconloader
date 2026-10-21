@@ -13,7 +13,7 @@
   <header class="topbar">
     <div class="title-wrap">
       <h1>LKM Loader</h1>
-      <p class="sub"><span id="ui-version">v1.2.0</span> · <span id="ui-id">lkmloader</span> · <span id="ui-manager">…</span></p>
+      <p class="sub"><span id="ui-version">v1.2.6</span> · <span id="ui-id">lkmloader</span> · <span id="ui-manager">…</span></p>
     </div>
   </header>
 
@@ -55,6 +55,7 @@
           <span class="pill" id="st-blocked">—</span>
         </div>
       </div>
+      <p class="hint" id="st-hint" hidden></p>
 
       <div class="actions">
         <button class="btn" id="btn-refresh">刷新</button>
@@ -76,20 +77,33 @@
           <h2 class="view-title">模块</h2>
           <p class="hint" id="mod-count">—</p>
         </div>
-        <button class="btn small primary" id="btn-import">导入 .ko</button>
+        <div class="head-actions">
+          <button class="btn small" id="btn-hot">热加载</button>
+          <button class="btn small primary" id="btn-import">导入 .ko</button>
+        </div>
       </div>
 
       <div id="mod-list"></div>
 
       <div class="empty" id="mod-empty" hidden>
         <p>还没有导入任何模块</p>
-        <p class="muted small">点击右上角「导入 .ko」，从设备目录里选择内核模块</p>
+        <p class="muted small">两个按钮都会拉起系统文件选择器：「导入 .ko」复制进模块并加入开机加载，
+          「热加载」只挂进当前内核、重启即失效</p>
+      </div>
+
+      <h2 class="section-title">已加载</h2>
+      <div class="card pad">
+        <button class="btn wide" id="btn-loaded">查看内核里已加载的模块</button>
+        <p class="desc spaced">读 /proc/modules，本模块加载的排在前面。点条目即可卸载，
+          非本模块加载的 LKM 同样有效。</p>
       </div>
 
       <h2 class="section-title">说明</h2>
       <div class="card pad">
         <p class="note">导入的 .ko 会复制到模块目录的 <code>lkm/</code> 下，开机时按各自的时机加载。
-        非导出符号由内核侧 loader 用 kallsyms 重建后逐个回填。</p>
+        非导出符号由内核侧 loader 用 kallsyms 重建后逐个回填。
+        <br>「临时」条目来自热加载，文件留在原路径、不写配置；点「加入开机」才会持久化，
+        此时开机从原路径读取，注意该路径在所选时机是否已经可用。</p>
       </div>
     </section>
 
@@ -175,49 +189,35 @@
   </nav>
 </div>
 
-<!-- ------------------------------------------------------- file picker sheet -->
-<div class="sheet-wrap" id="sheet" hidden>
-  <div class="sheet-mask" id="sheet-mask"></div>
-  <div class="sheet" role="dialog" aria-modal="true" aria-label="选择 .ko 文件">
+<!-- ------------------------------------------------ android file chooser -->
+<input type="file" id="file-pick" accept=".ko,application/octet-stream" class="file-input">
+
+<div class="toast" id="toast" hidden></div>
+
+<!-- ------------------------------------------------------ loaded lkm sheet -->
+<div class="sheet-wrap" id="sheet-loaded" hidden>
+  <div class="sheet-mask" id="ld-mask"></div>
+  <div class="sheet" role="dialog" aria-modal="true" aria-label="已加载的内核模块">
     <div class="sheet-grip"></div>
     <div class="sheet-head">
-      <h3>选择 .ko 文件</h3>
-      <button class="icon-btn" id="sheet-close" aria-label="关闭">
+      <h3>已加载的内核模块</h3>
+      <button class="icon-btn" id="ld-close" aria-label="关闭">
         <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
       </button>
     </div>
-
-    <div class="crumb">
-      <button class="icon-btn" id="crumb-up" aria-label="上级目录">
-        <svg viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
-      </button>
-      <span id="crumb-path">/sdcard/Download</span>
-    </div>
-
-    <div class="quick" id="quick-jumps">
-      <button data-path="/sdcard/Download">Download</button>
-      <button data-path="/sdcard">内部存储</button>
-      <button data-path="/data/local/tmp">local/tmp</button>
-      <button data-path="/data/adb/modules">modules</button>
-    </div>
-
     <div class="filter-row">
-      <label class="switch small"><input type="checkbox" id="only-ko" checked><i></i></label>
-      <span>仅显示 .ko</span>
-      <span class="spacer"></span>
-      <button class="link" id="pick-manual">手动输入路径</button>
+      <input class="search" id="ld-search" type="search" placeholder="按名字筛选" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <span class="small" id="ld-count">—</span>
+      <button class="link" id="ld-refresh">刷新</button>
     </div>
-
-    <div class="filelist" id="filelist"></div>
-
+    <div class="filelist" id="ld-list"></div>
+    <p class="note small">点条目即可卸载，对非本模块加载的 LKM 同样有效。引用计数大于 0 的模块不允许操作，
+      强行卸载正在使用的模块可能立刻导致系统异常。</p>
     <div class="sheet-foot">
-      <button class="btn" id="pick-cancel">取消</button>
-      <button class="btn primary" id="pick-confirm" disabled>导入</button>
+      <button class="btn" id="ld-done">关闭</button>
     </div>
   </div>
 </div>
-
-<div class="toast" id="toast" hidden></div>
 
 <!-- ------------------------------------------------------ module detail sheet -->
 <div class="sheet-wrap" id="sheet-module" hidden>

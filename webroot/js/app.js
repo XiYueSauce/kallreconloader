@@ -15,14 +15,17 @@
     optFile: {},
     defaultStage: 'service',
     logs: { loader: '', boot: '' },
-    picker: { path: '/sdcard/Download', parent: '/sdcard', selected: null, onlyKo: true },
+    logKey: '',
+    loaded: [],
+    pickMode: 'import',
     editing: null,
     busy: false,
-    poll: null
+    poll: null,
+    downTicks: 0
   };
 
   var ACTION_BUTTONS = [
-    '#btn-refresh', '#btn-reload', '#btn-clear', '#btn-import',
+    '#btn-refresh', '#btn-reload', '#btn-clear', '#btn-import', '#btn-hot',
     '#md-reload', '#md-toggle', '#md-delete', '#btn-restart-loader'
   ];
 
@@ -54,6 +57,20 @@
     if (p.indexOf(base) === 0) return p.slice(base.length);
     if (p.length <= 46) return p;
     return p.slice(0, 20) + '…' + p.slice(-22);
+  }
+
+  /*
+   * An unresolved symbol is the one load failure the user cannot fix from the
+   * UI: the name is neither in kallsyms nor exported by a loaded module, which
+   * in practice means the .ko was linked against a library object it did not
+   * include. Say that instead of repeating the loader's errno.
+   */
+  function explain(text) {
+    var s = String(text == null ? '' : text).trim();
+    if (/unresolved symbol/i.test(s)) {
+      return s + '\n缺失的符号既不在内核符号表里，也不是已加载模块导出的——通常是这个 ko 少链了依赖库的对象文件，需要在构建端补上。';
+    }
+    return s;
   }
 
   function pill(text, kind) {
@@ -123,9 +140,9 @@
       tab.classList.toggle('active', tab.dataset.view === view);
     });
     try { history.replaceState(null, '', '#' + view); } catch (e) { /* file:// in some shells */ }
-    if (view === 'modules') refreshModules().catch(function (e) { toast('读取模块失败：' + e.message); });
+    /* no fetching here: the bootstrap already filled state, switching tabs is
+       pure DOM work so the UI stays instant */
     if (view === 'settings') renderSettings();
-    if (view === 'status') refreshLogs();
   }
 
   /* ------------------------------------------------------------------ status */
@@ -144,6 +161,22 @@
       loaderPill.classList.add('bad');
     } else {
       loaderPill.textContent = '未加载';
+      loaderPill.classList.add('warn');
+    }
+
+    var hint = $('#st-hint');
+    if (s.loaderUp && !s.ctlReadable) {
+      hint.hidden = false;
+      hint.textContent = 'loader 进程在运行，但 /proc/lkmctl 没有输出（权限或 SELinux 限制），符号与缓存数字不可用。';
+    } else if (!s.loaderUp && !s.koExists) {
+      hint.hidden = false;
+      hint.textContent = 'ko/lkmloader.ko 不存在：安装时没有匹配到当前内核的 KMI，重装模块即可。';
+    } else if (!s.loaderUp) {
+      hint.hidden = false;
+      hint.textContent = 'loader 未加载。点「重新加载」按 ko/options 里的参数重新 insmod。';
+    } else {
+      hint.hidden = true;
+      hint.textContent = '';
     }
 
     $('#st-kernel').textContent = s.kernel;
@@ -209,8 +242,17 @@
     return ({ '-1': 'default', '0': 'auto', '1': 'seqs', '2': 'llvm', '3': 'dollar' })[String(v)] || String(v);
   }
 
+  /* the log box is the most expensive thing to rebuild: only touch the DOM
+     when the text really changed, and keep the scroll position when the user
+     has scrolled up to read something */
   function renderLogs() {
+    var key = (state.logs.loader || '') + '\u0000' + (state.logs.boot || '');
+    if (key === state.logKey) return;
+    state.logKey = key;
+
     var box = $('#st-logs');
+    var atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+
     box.textContent = '';
     var loader = (state.logs.loader || '').split('\n').filter(Boolean);
     var boot = (state.logs.boot || '').split('\n').filter(Boolean);
@@ -233,7 +275,7 @@
       box.appendChild(sep);
       boot.forEach(function (line) { box.appendChild(logLine(line)); });
     }
-    box.scrollTop = box.scrollHeight;
+    if (atBottom) box.scrollTop = box.scrollHeight;
   }
 
   function logLine(line) {
@@ -279,9 +321,12 @@
   function renderModules() {
     var list = $('#mod-list');
     list.textContent = '';
+    var loaded = state.modules.filter(function (m) { return m.loaded; }).length;
+    var hot = state.modules.filter(function (m) { return m.hot; }).length;
+
     $('#mod-empty').hidden = state.modules.length > 0;
     $('#mod-count').textContent = state.modules.length
-      ? state.modules.length + ' 个已导入 · ' + state.modules.filter(function (m) { return m.loaded; }).length + ' 个已加载'
+      ? state.modules.length + ' 个模块 · ' + loaded + ' 个已加载' + (hot ? ' · ' + hot + ' 个临时' : '')
       : '尚未导入模块';
 
     state.modules.forEach(function (m) {
@@ -313,14 +358,39 @@
 
       var chips = document.createElement('div');
       chips.className = 'chips';
-      var stage = document.createElement('button');
-      stage.className = 'chip stage' + (m.stage === 'manual' ? ' manual' : '');
-      stage.textContent = stageLabel(m.stage);
-      stage.addEventListener('click', function (e) {
-        e.stopPropagation();
-        cycleStage(m);
-      });
-      chips.appendChild(stage);
+
+      if (m.hot) {
+        var tmp = document.createElement('span');
+        tmp.className = 'chip';
+        tmp.style.color = 'var(--warn)';
+        tmp.style.borderColor = 'transparent';
+        tmp.style.background = 'var(--warn-bg)';
+        tmp.textContent = '临时';
+        chips.appendChild(tmp);
+
+        var boot = document.createElement('button');
+        boot.className = 'chip action';
+        boot.textContent = '加入开机';
+        boot.addEventListener('click', function (e) {
+          e.stopPropagation();
+          guard(function () {
+            return LKM.addToBoot(m.path, m.args).then(function (r) {
+              toast(r.name + ' 已加入开机加载');
+              return Promise.all([refreshModules(), refreshStatus()]);
+            });
+          });
+        });
+        chips.appendChild(boot);
+      } else {
+        var stage = document.createElement('button');
+        stage.className = 'chip stage' + (m.stage === 'manual' ? ' manual' : '');
+        stage.textContent = stageLabel(m.stage);
+        stage.addEventListener('click', function (e) {
+          e.stopPropagation();
+          cycleStage(m);
+        });
+        chips.appendChild(stage);
+      }
 
       if (m._compatible === false) {
         var warn = document.createElement('span');
@@ -334,25 +404,27 @@
 
       foot.appendChild(chips);
 
-      var sw = document.createElement('label');
-      sw.className = 'switch';
-      var input = document.createElement('input');
-      input.type = 'checkbox';
-      input.checked = m.enabled !== false;
-      input.addEventListener('change', function () {
-        var want = input.checked;
-        LKM.updateModule(m.name, { enabled: want }).then(function () {
-          m.enabled = want;
-          toast(want ? m.name + ' 将在开机时加载' : m.name + ' 已停止开机加载');
-        }).catch(function (e) {
-          input.checked = !want;      /* roll the UI back */
-          toast('保存失败：' + (e.message || '未知错误'));
+      if (!m.hot) {
+        var sw = document.createElement('label');
+        sw.className = 'switch';
+        var input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = m.enabled !== false;
+        input.addEventListener('change', function () {
+          var want = input.checked;
+          LKM.updateModule(m.name, { enabled: want }).then(function () {
+            m.enabled = want;
+            toast(want ? m.name + ' 将在开机时加载' : m.name + ' 已停止开机加载');
+          }).catch(function (e) {
+            input.checked = !want;      /* roll the UI back */
+            toast('保存失败：' + (e.message || '未知错误'));
+          });
         });
-      });
-      var i = document.createElement('i');
-      sw.appendChild(input);
-      sw.appendChild(i);
-      foot.appendChild(sw);
+        var i = document.createElement('i');
+        sw.appendChild(input);
+        sw.appendChild(i);
+        foot.appendChild(sw);
+      }
 
       card.appendChild(foot);
 
@@ -394,7 +466,11 @@
     $$('#md-stage button').forEach(function (b) {
       b.classList.toggle('active', b.dataset.stage === m.stage);
     });
+
     $('#md-toggle').textContent = m.loaded ? '卸载' : '加载';
+    var owned = String(m.path).indexOf(String(LKM.modDir || '') + '/') === 0;
+    $('#md-delete').textContent = (m.hot || !owned) ? '移除' : '删除';
+    $('#md-reload').textContent = m.hot ? '加入开机' : '重载';
     openSheet('#sheet-module');
   }
 
@@ -415,113 +491,173 @@
     document.body.style.overflow = '';
   }
 
-  function openPicker() {
-    state.picker.selected = null;
-    $('#pick-confirm').disabled = true;
-    $('#pick-confirm').textContent = '导入';
-    openSheet('#sheet');
-    loadDir(state.picker.path);
+  /*
+   * Import goes through the Android file chooser: a plain <input type=file>
+   * in the WebView opens the system picker, so third party file managers can
+   * handle it and the module no longer ships a directory browser of its own.
+   */
+  function pickFile(mode) {
+    state.pickMode = mode === 'hot' ? 'hot' : 'import';
+    var input = $('#file-pick');
+    input.value = '';
+    input.click();
   }
 
-  function loadDir(path) {
-    var list = $('#filelist');
-    list.textContent = '';
-    var loading = document.createElement('div');
-    loading.className = 'empty';
-    loading.innerHTML = '<p class="muted">读取中…</p>';
-    list.appendChild(loading);
+  function onFilePicked(ev) {
+    var input = ev.target;
+    var file = input.files && input.files[0];
+    var mode = state.pickMode;
+    input.value = '';
+    if (!file) return;
 
-    $('#crumb-path').textContent = path;
-    state.picker.path = path;
-    state.picker.parent = dirname(path);
-
-    LKM.listDir(path).then(function (rows) {
-      list.textContent = '';
-      var onlyKo = state.picker.onlyKo;
-      var shown = rows.filter(function (r) {
-        if (r.type === 'dir') return true;
-        return !onlyKo || /\.ko$/i.test(r.name);
-      });
-
-      if (!shown.length) {
-        var empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.innerHTML = '<p class="muted">这里没有' + (onlyKo ? ' .ko 文件' : '文件') + '</p>';
-        list.appendChild(empty);
-      }
-
-      shown.forEach(function (r) {
-        var btn = document.createElement('button');
-        btn.className = 'file';
-
-        var ico = document.createElement('span');
-        ico.className = 'ico' + (r.type === 'dir' ? ' dir' : (/\.ko$/i.test(r.name) ? ' ko' : ''));
-        ico.textContent = r.type === 'dir' ? 'DIR' : (/\.ko$/i.test(r.name) ? 'KO' : 'FILE');
-
-        var meta = document.createElement('span');
-        meta.className = 'meta';
-        var nm = document.createElement('span');
-        nm.className = 'name';
-        nm.textContent = r.name;
-        meta.appendChild(nm);
-        var sz = document.createElement('span');
-        sz.className = 'sz';
-        sz.textContent = r.type === 'dir' ? '文件夹' : LKM.humanSize(r.size);
-        meta.appendChild(sz);
-
-        btn.appendChild(ico);
-        btn.appendChild(meta);
-
-        var full = (path === '/' ? '' : path) + '/' + r.name;
-        btn.addEventListener('click', function () {
-          if (r.type === 'dir') {
-            loadDir(full);
-          } else if (/\.ko$/i.test(r.name)) {
-            $$('.file', list).forEach(function (x) { x.classList.remove('selected'); });
-            btn.classList.add('selected');
-            state.picker.selected = { path: full, name: r.name };
-            $('#pick-confirm').disabled = false;
-            $('#pick-confirm').textContent = '导入 ' + r.name;
-          } else {
-            toast('请选择 .ko 文件');
-          }
+    if (mode === 'hot') {
+      guard(function () {
+        toast('正在热加载 ' + file.name + '（' + LKM.humanSize(file.size) + '）…', 6000);
+        return LKM.hotLoadBlob(file).then(function (r) {
+          if (r.ok) toast('已热加载 ' + r.name + '.ko（重启后失效）', 3600);
+          else toast('热加载失败：' + explain(r.err || '查看日志'), 6000);
+          return Promise.all([refreshModules(), refreshStatus(), refreshLogs()]);
         });
-
-        list.appendChild(btn);
       });
-    }).catch(function (e) {
-      list.textContent = '';
-      var err = document.createElement('div');
-      err.className = 'empty';
-      var p = document.createElement('p');
-      p.className = 'muted';
-      p.textContent = e.message;
-      err.appendChild(p);
-      list.appendChild(err);
-    });
-  }
-
-  function doImport() {
-    var sel = state.picker.selected;
-    if (!sel) return;
-
-    var base = LKM.sanitizeName(sel.name);
-    var dup = state.modules.filter(function (m) { return m.name === base; })[0];
-    if (dup && !window.confirm(base + '.ko 已存在，覆盖并重新加载？')) return;
+      return;
+    }
 
     guard(function () {
-      $('#pick-confirm').disabled = true;
-      return LKM.importKo(sel.path, sel.name).then(function (r) {
-        closeSheet('#sheet');
+      toast('正在写入 ' + file.name + '（' + LKM.humanSize(file.size) + '）…', 6000);
+      return LKM.importBlob(file).then(function (r) {
         toast((r.replaced ? '已覆盖 ' : '已导入 ') + r.name + '.ko，正在加载…');
         return LKM.loadOne({ name: r.name, path: r.path, args: '' });
       }).then(function (res) {
         if (res && res.ok) toast('加载成功');
-        else toast('已导入，但加载失败：' + ((res && (res.err || res.out)) || '未知错误'), 4200);
-        return Promise.all([refreshModules(), refreshStatus()]);
+        else toast('已导入，但加载失败：' + explain((res && (res.err || res.out)) || '未知错误'), 6000);
+        return Promise.all([refreshModules(), refreshStatus(), refreshLogs()]);
       });
-    }).then(function () {
-      $('#pick-confirm').disabled = !state.picker.selected;
+    });
+  }
+
+  /* ------------------------------------------------------- loaded modules */
+
+  function openLoaded() {
+    openSheet('#sheet-loaded');
+    $('#ld-search').value = '';
+    if (!state.loaded.length) {
+      $('#ld-list').innerHTML = '<div class="empty"><p class="muted">读取中…</p></div>';
+    }
+    refreshLoaded();
+  }
+
+  function refreshLoaded() {
+    return LKM.loadedModules().then(function (rows) {
+      state.loaded = rows;
+      renderLoaded();
+    }).catch(function (e) {
+      $('#ld-list').textContent = '';
+      var err = document.createElement('div');
+      err.className = 'empty';
+      var p = document.createElement('p');
+      p.className = 'muted';
+      p.textContent = '读取失败：' + (e.message || '未知错误');
+      err.appendChild(p);
+      $('#ld-list').appendChild(err);
+    });
+  }
+
+  /* names this module manages, so its own LKMs can be picked out of the
+     couple of hundred vendor modules /proc/modules reports */
+  function managedSet() {
+    var set = {};
+    state.modules.forEach(function (m) {
+      set[LKM.kernelName(m.name)] = true;
+    });
+    return set;
+  }
+
+  function renderLoaded() {
+    var list = $('#ld-list');
+    var kw = ($('#ld-search').value || '').trim().toLowerCase();
+    var managed = managedSet();
+
+    var rows = state.loaded.filter(function (r) {
+      return !kw || r.name.toLowerCase().indexOf(kw) >= 0;
+    });
+
+    rows.sort(function (a, b) {
+      var ma = managed[a.name] ? 1 : 0;
+      var mb = managed[b.name] ? 1 : 0;
+      if (ma !== mb) return mb - ma;
+      return a.name.localeCompare(b.name, 'en');
+    });
+
+    $('#ld-count').textContent = state.loaded.length
+      ? rows.length + ' / ' + state.loaded.length
+      : '—';
+
+    list.textContent = '';
+    if (!rows.length) {
+      var empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.innerHTML = '<p class="muted">没有匹配的模块</p>';
+      list.appendChild(empty);
+      return;
+    }
+
+    rows.forEach(function (r) {
+      var btn = document.createElement('button');
+      btn.className = 'file';
+
+      var ico = document.createElement('span');
+      ico.className = 'ico ko';
+      ico.textContent = 'LKM';
+
+      var meta = document.createElement('span');
+      meta.className = 'meta';
+      var head = document.createElement('span');
+      head.className = 'name-row';
+      var nm = document.createElement('span');
+      nm.className = 'name';
+      nm.textContent = r.name;
+      head.appendChild(nm);
+      if (managed[r.name]) {
+        var tag = document.createElement('span');
+        tag.className = 'pill ok';
+        tag.textContent = '本模块';
+        head.appendChild(tag);
+      }
+      meta.appendChild(head);
+      var sz = document.createElement('span');
+      sz.className = 'sz';
+      sz.textContent = LKM.humanSize(r.size) + (r.refs ? ' · 被引用 ' + r.refs : ' · 可卸载');
+      meta.appendChild(sz);
+
+      btn.appendChild(ico);
+      btn.appendChild(meta);
+
+      var self = r.name === 'lkmloader';
+      if (self || r.refs > 0) {
+        btn.disabled = true;
+        var why = document.createElement('span');
+        why.className = 'sz right';
+        why.textContent = self ? 'loader 本身' : '被引用 ' + r.refs;
+        btn.appendChild(why);
+      }
+
+      btn.addEventListener('click', function () {
+        if (self) {
+          toast('lkmloader 是 loader 本身，要重启请用设置页的「重启 loader」');
+          return;
+        }
+        if (!window.confirm('卸载 ' + r.name + '？\n\n它会立刻从运行中的内核里移除，' +
+          '依赖它的功能可能立即失效。')) return;
+        guard(function () {
+          return LKM.unloadByName(r.name).then(function (res) {
+            if (res.ok) toast(res.state === 'absent' ? r.name + ' 本来就没加载' : '已卸载 ' + r.name);
+            else toast('卸载失败：' + (res.err || '模块仍在使用'), 4200);
+            return Promise.all([refreshLoaded(), refreshModules(), refreshStatus(), refreshLogs()]);
+          });
+        });
+      });
+
+      list.appendChild(btn);
     });
   }
 
@@ -540,10 +676,23 @@
     });
   }
 
+  function renderMeta(meta) {
+    if (meta && meta.version) {
+      $('#ui-version').textContent = meta.version;
+      $('#about-version').textContent = meta.version;
+    }
+    if (meta && meta.id) {
+      $('#ui-id').textContent = meta.id;
+      $('#about-id').textContent = meta.id;
+    }
+  }
+
   /* ------------------------------------------------------------------ actions */
 
   function refreshAll() {
-    return Promise.all([refreshStatus(), refreshModules(), refreshLogs()]);
+    return refreshStatus().then(function () {
+      return Promise.all([refreshModules(), refreshLogs()]);
+    });
   }
 
   function reloadAll() {
@@ -556,7 +705,7 @@
             : 'loader 无法加载，确认 ko/ 下的 lkmloader.ko 存在');
         }
         var targets = state.modules.filter(function (m) {
-          return m.enabled !== false && m.stage !== 'manual';
+          return !m.hot && m.enabled !== false && m.stage !== 'manual';
         });
         if (!targets.length) {
           toast('loader 已就绪（v' + (r.version || '?') + '，' + r.syms + ' 符号），没有需要重载的模块', 3600);
@@ -611,31 +760,16 @@
       });
     });
 
-    $('#btn-import').addEventListener('click', openPicker);
+    $('#btn-import').addEventListener('click', function () { pickFile('import'); });
+    $('#btn-hot').addEventListener('click', function () { pickFile('hot'); });
+    $('#btn-loaded').addEventListener('click', openLoaded);
+    $('#file-pick').addEventListener('change', onFilePicked);
 
-    $('#sheet-close').addEventListener('click', function () { closeSheet('#sheet'); });
-    $('#pick-cancel').addEventListener('click', function () { closeSheet('#sheet'); });
-    $('#sheet-mask').addEventListener('click', function () { closeSheet('#sheet'); });
-    $('#pick-confirm').addEventListener('click', doImport);
-    $('#crumb-up').addEventListener('click', function () {
-      loadDir(state.picker.parent || '/sdcard');
-    });
-    $$('#quick-jumps button').forEach(function (b) {
-      b.addEventListener('click', function () { loadDir(b.dataset.path); });
-    });
-    $('#only-ko').addEventListener('change', function () {
-      state.picker.onlyKo = this.checked;
-      loadDir(state.picker.path);
-    });
-    $('#pick-manual').addEventListener('click', function () {
-      var p = window.prompt('输入 .ko 的完整路径', state.picker.path + '/');
-      if (!p) return;
-      var name = p.split('/').pop();
-      state.picker.selected = { path: p, name: name };
-      $('#pick-confirm').disabled = false;
-      $('#pick-confirm').textContent = '导入 ' + name;
-      toast('已选择 ' + name);
-    });
+    $('#ld-close').addEventListener('click', function () { closeSheet('#sheet-loaded'); });
+    $('#ld-mask').addEventListener('click', function () { closeSheet('#sheet-loaded'); });
+    $('#ld-done').addEventListener('click', function () { closeSheet('#sheet-loaded'); });
+    $('#ld-refresh').addEventListener('click', function () { refreshLoaded(); });
+    $('#ld-search').addEventListener('input', renderLoaded);
 
     $('#md-close').addEventListener('click', closeModuleSheet);
     $('#md-mask').addEventListener('click', closeModuleSheet);
@@ -649,6 +783,19 @@
     $('#md-reload').addEventListener('click', function () {
       var m = state.editing;
       if (!m) return;
+
+      /* a hot module is not in config.json: the useful action is to keep it */
+      if (m.hot) {
+        guard(function () {
+          return LKM.addToBoot(m.path, m.args).then(function (r) {
+            toast(r.name + ' 已加入开机加载');
+            closeModuleSheet();
+            return Promise.all([refreshModules(), refreshStatus()]);
+          });
+        });
+        return;
+      }
+
       var stageBtn = $('#md-stage button.active');
       var patch = {
         args: LKM.sanitizeArgs($('#md-args').value),
@@ -664,7 +811,7 @@
           if (r && r.ok) toast('重载成功');
           else toast('重载失败：' + ((r && (r.err || r.out)) || '未知错误'), 4200);
           closeModuleSheet();
-          return Promise.all([refreshModules(), refreshStatus()]);
+          return Promise.all([refreshModules(), refreshStatus(), refreshLogs()]);
         });
       });
     });
@@ -672,6 +819,20 @@
     $('#md-toggle').addEventListener('click', function () {
       var m = state.editing;
       if (!m) return;
+
+      /* hot modules unload through the kernel directly */
+      if (m.hot) {
+        guard(function () {
+          return LKM.unloadByName(m.name).then(function (r) {
+            if (r.ok) toast('已卸载 ' + m.name);
+            else toast('卸载失败：' + (r.err || '模块仍在使用'), 4200);
+            closeModuleSheet();
+            return Promise.all([refreshModules(), refreshStatus(), refreshLogs()]);
+          });
+        });
+        return;
+      }
+
       var wasLoaded = m.loaded;
       guard(function () {
         var job = wasLoaded ? LKM.unloadOne(m) : LKM.loadOne(m);
@@ -680,10 +841,10 @@
             if (r.ok) toast(r.state === 'absent' ? '本来就未加载' : '已卸载 ' + m.name);
             else toast('卸载失败：' + (r.err || '模块仍在使用'), 4200);
           } else {
-            toast(r && r.ok ? '加载成功' : '加载失败：' + ((r && (r.err || r.out)) || '未知错误'), 4200);
+            toast(r && r.ok ? '加载成功' : '加载失败：' + explain((r && (r.err || r.out)) || '未知错误'), 6000);
           }
           closeModuleSheet();
-          return Promise.all([refreshModules(), refreshStatus()]);
+          return Promise.all([refreshModules(), refreshStatus(), refreshLogs()]);
         });
       });
     });
@@ -691,10 +852,28 @@
     $('#md-delete').addEventListener('click', function () {
       var m = state.editing;
       if (!m) return;
-      if (!window.confirm('删除 ' + m.name + '.ko？文件会一并删除。')) return;
+
+      if (m.hot) {
+        guard(function () {
+          return LKM.unloadByName(m.name).then(function (r) {
+            toast(r.ok ? '已从列表移除并卸载 ' + m.name : '卸载失败：' + (r.err || '模块仍在使用'), 3800);
+            closeModuleSheet();
+            return Promise.all([refreshModules(), refreshStatus()]);
+          });
+        });
+        return;
+      }
+
+      /* only files that live inside the module dir are deleted with the entry;
+         a module added to boot from elsewhere keeps its file */
+      var owned = String(m.path).indexOf(String(LKM.modDir || '') + '/') === 0;
+      if (!window.confirm(owned
+        ? '删除 ' + m.name + '.ko？文件会一并删除。'
+        : '把 ' + m.name + ' 从开机列表移除？原文件（' + m.path + '）会保留。')) return;
+
       guard(function () {
-        return LKM.removeModule(m.name).then(function () {
-          toast('已删除 ' + m.name);
+        return LKM.removeModule(m.name).then(function (r) {
+          toast(r && r.removedFile ? '已删除 ' + m.name : '已移除 ' + m.name + '（原文件保留）');
           closeModuleSheet();
           return Promise.all([refreshModules(), refreshStatus()]);
         });
@@ -748,7 +927,7 @@
           toast(r.ok
             ? 'loader 已重启 v' + (r.version || '?') + '，' + r.syms + ' 符号'
             : '重启失败：' + (r.up ? 'kallsyms 重建失败' : 'ko 无法加载'), 3600);
-          return refreshStatus();
+          return refreshAll();
         });
       });
     });
@@ -760,34 +939,41 @@
   }
 
   /*
-   * Cheap poll: one `cat /proc/lkmctl` instead of pulling the whole log every
-   * tick. The loader bumps `seq` for every operation, so the log is re-read
-   * only when something actually happened.
+   * Cheap poll: one shell that only reads the loader's counters. The loader
+   * bumps `seq` on every operation, so the log is re-read only when something
+   * really happened.
    */
   function pollStatus() {
-    return LKM.ctl().then(function (ctl) {
+    return LKM.tick().then(function (t) {
       var prev = state.status || {};
-      if (!ctl || ctl.loader !== 'lkmloader') {
-        return refreshStatus();
+
+      if (!t.loaderUp) {
+        state.downTicks++;
+        if (state.downTicks % 3 === 0) return refreshStatus();
+        if (prev.loaderUp) {
+          state.status = Object.assign({}, prev, { loaderUp: false, ctlReadable: false });
+          renderStatus();
+        }
+        return;
       }
-      var seq = parseInt(ctl.seq || '0', 10) || 0;
+      state.downTicks = 0;
+
+      var changed = t.seq !== prev.seq;
       state.status = Object.assign({}, prev, {
-        seq: seq,
         loaderUp: true,
-        symbols: parseInt(ctl.num_syms || '0', 10) || 0,
-        layout: ctl.layout != null ? ctl.layout : '',
-        loads: parseInt(ctl.loads || '0', 10) || 0,
-        fails: parseInt(ctl.fails || '0', 10) || 0,
-        cacheUsed: parseInt(ctl.cache_used || '0', 10) || 0,
-        cacheHits: parseInt(ctl.cache_hits || '0', 10) || 0,
-        lastTarget: ctl.last_target || '',
-        lastPatched: parseInt(ctl.last_patched || '0', 10) || 0,
-        lastNative: parseInt(ctl.last_native || '0', 10) || 0,
-        lastErrno: ctl.last_errno,
-        lastMsg: ctl.last_msg || ''
+        ctlReadable: t.ctlReadable,
+        seq: t.seq,
+        /* with an unreadable /proc/lkmctl the counters come back empty:
+           keep the last known values instead of showing zeros */
+        loads: t.ctlReadable ? t.loads : (prev.loads || 0),
+        fails: t.ctlReadable ? t.fails : (prev.fails || 0),
+        symbols: t.symbols || prev.symbols || 0,
+        cacheUsed: t.cacheUsed || prev.cacheUsed || 0,
+        cacheHits: t.cacheHits || prev.cacheHits || 0,
+        lastMsg: t.lastMsg || prev.lastMsg || ''
       });
       renderStatus();
-      if (seq !== (parseInt(prev.seq || '0', 10) || 0)) return refreshLogs();
+      if (changed) return refreshLogs();
     });
   }
 
@@ -795,14 +981,77 @@
     stopPoll();
     state.poll = setInterval(function () {
       if (document.hidden || state.busy) return;
-      if (state.view === 'status') pollStatus().catch(function () {});
-      if (state.view === 'modules') refreshModules().catch(function () {});
-    }, 8000);
+      /* a modal owns the screen: polling behind it only steals shell time
+         from whatever the user is doing in there */
+      if (!$('#sheet-loaded').hidden || !$('#sheet-module').hidden) return;
+      if (state.view === 'status') {
+        pollStatus().catch(function () {});
+      } else if (state.view === 'modules') {
+        refreshModules().catch(function () {});
+      }
+    }, 6000);
   }
 
   function stopPoll() {
     if (state.poll) clearInterval(state.poll);
     state.poll = null;
+  }
+
+  function fullScreen() {
+    if (window.ksu && typeof window.ksu.fullScreen === 'function') {
+      try { window.ksu.fullScreen(true); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function renderBridgeError(e) {
+    var pill = $('#st-loader');
+    pill.className = 'pill bad';
+    pill.textContent = '无法读取';
+    var hint = $('#st-hint');
+    hint.hidden = false;
+    hint.textContent = 'WebUI 执行命令失败（' + ((e && e.message) || '未知错误') +
+      '）。状态无法确认，这不代表 loader 没有加载。';
+    $('#ui-manager').textContent = LKM.isDemo ? 'Browser' : 'Unknown';
+  }
+
+  function bootstrap() {
+    /* everything that needs the module dir is fired at once: the dir lookup
+       and config read are shared through memoized promises */
+    return guard(function () {
+      return Promise.all([
+        LKM.status().catch(function (e) { return { error: e }; }),
+        LKM.loadConfig().catch(function () { return null; }),
+        LKM.readOptionsFile().catch(function () { return {}; }),
+        LKM.meta().catch(function () { return {}; })
+      ]).then(function (r) {
+        var s = r[0];
+        var cfg = r[1];
+
+        if (cfg) {
+          state.options = cfg.options;
+          state.defaultStage = cfg.defaultStage;
+        }
+        state.optFile = r[2] || {};
+        renderMeta(r[3]);
+        renderParams();
+        renderSettings();
+
+        if (s && !s.error) {
+          state.status = s;
+          renderStatus();
+        } else {
+          renderBridgeError(s && s.error);
+        }
+
+        return Promise.all([
+          refreshModules().catch(function () {}),
+          refreshLogs()
+        ]);
+      });
+    }).then(function () {
+      fullScreen();
+      startPoll();
+    });
   }
 
   function init() {
@@ -812,35 +1061,7 @@
     var hash = (location.hash || '').replace('#', '');
     setView(['status', 'modules', 'settings'].indexOf(hash) >= 0 ? hash : 'status');
 
-    LKM.loadConfig().then(function (cfg) {
-      state.options = cfg.options;
-      state.defaultStage = cfg.defaultStage;
-      return LKM.readOptionsFile();
-    }).then(function (optFile) {
-      state.optFile = optFile || {};
-      renderParams();
-      renderSettings();
-    }).catch(function () {});
-
-    LKM.meta().then(function (meta) {
-      if (meta && meta.version) {
-        $('#ui-version').textContent = meta.version;
-        $('#about-version').textContent = meta.version;
-      }
-      if (meta && meta.id) {
-        $('#ui-id').textContent = meta.id;
-        $('#about-id').textContent = meta.id;
-      }
-    }).catch(function () {});
-
-    guard(function () {
-      return refreshAll();
-    }).then(function () {
-      if (window.ksu && typeof window.ksu.fullScreen === 'function') {
-        try { window.ksu.fullScreen(true); } catch (e) { /* ignore */ }
-      }
-      startPoll();
-    });
+    bootstrap();
   }
 
   if (document.readyState === 'loading') {

@@ -23,6 +23,7 @@ if command -v node >/dev/null 2>&1; then
 	for f in webroot/js/*.js; do
 		node --check "$f" || bad "js syntax: $f"
 	done
+	node scripts/test-webui.js || bad "webui tests"
 else
 	note "node not found, skipping javascript syntax"
 fi

@@ -9,7 +9,12 @@
 
   var state = {
     modDir: null,
-    config: null
+    config: null,
+    device: null,
+    vermagic: {},
+    /* modules loaded through the WebUI without being added to config.json;
+       they only live for this session, they are never written to disk */
+    hot: []
   };
 
   var DEFAULT_CONFIG = {
@@ -39,8 +44,21 @@
       .slice(0, 64) || 'module';
   }
 
+  /* the kernel derives a module name from the file name by replacing every
+     byte outside [A-Za-z0-9_] with '_'; /proc/modules only shows that form */
+  function kernelName(name) {
+    return String(name || '')
+      .replace(/\.ko$/i, '')
+      .replace(/[^A-Za-z0-9_]/g, '_');
+  }
+
+  function baseName(path) {
+    return String(path || '').split('/').pop();
+  }
+
   function nameVariants(name) {
-    var set = [name, name.replace(/-/g, '_')];
+    var k = kernelName(name);
+    var set = [name, k, k.replace(/_/g, '-')];
     return set.filter(function (v, i) { return v && set.indexOf(v) === i; });
   }
 
@@ -86,16 +104,28 @@
 
   /* --------------------------------------------------------------- storage */
 
+  /* the promise itself is memoized: several parts of the UI ask for the
+     module dir at once and none of them should pay for a second shell */
+  var modDirPromise = null;
+
   function resolveModDir() {
     if (state.modDir) return Promise.resolve(state.modDir);
+    if (modDirPromise) return modDirPromise;
+
     var script = MOD_DIRS.map(function (d) {
       return '[ -f ' + q(d + '/module.prop') + ' ] && echo ' + q(d);
     }).join('\n');
-    return global.Shell.execOk(script).then(function (out) {
+
+    modDirPromise = global.Shell.execOk(script).then(function (out) {
       var first = out.split('\n').filter(Boolean)[0];
       state.modDir = first || MOD_DIRS[0];
       return state.modDir;
+    }, function (e) {
+      modDirPromise = null;
+      throw e;
     });
+
+    return modDirPromise;
   }
 
   function configPath() {
@@ -124,9 +154,13 @@
     ].join('\n');
   }
 
+  var configPromise = null;
+
   function loadConfig() {
     if (state.config) return Promise.resolve(state.config);
-    return resolveModDir().then(function () {
+    if (configPromise) return configPromise;
+
+    configPromise = resolveModDir().then(function () {
       return global.Shell.readFile(configPath()).catch(function () { return ''; });
     }).then(function (text) {
       var cfg = clone(DEFAULT_CONFIG);
@@ -142,8 +176,14 @@
         }
       } catch (e) { /* first run, keep defaults */ }
       state.config = cfg;
+      configPromise = null;
       return cfg;
+    }, function (e) {
+      configPromise = null;
+      throw e;
     });
+
+    return configPromise;
   }
 
   function saveConfig(cfg) {
@@ -155,8 +195,147 @@
 
   /* ---------------------------------------------------------------- status */
 
+  /*
+   * One shell for the whole status page. Every exec costs a WebView round
+   * trip, so device properties, the loader's /proc/lkmctl dump and the
+   * presence checks are collected together instead of in four calls.
+   */
+  function probe() {
+    var ko = state.modDir + '/ko/lkmloader.ko';
+    var script = [
+      'echo "@kernel=$(uname -r 2>/dev/null)"',
+      'echo "@model=$(getprop ro.product.model 2>/dev/null)"',
+      'echo "@brand=$(getprop ro.product.brand 2>/dev/null)"',
+      'echo "@soc=$(getprop ro.board.platform 2>/dev/null)"',
+      'echo "@soc2=$(getprop ro.soc.model 2>/dev/null)"',
+      'echo "@android=$(getprop ro.build.version.release 2>/dev/null)"',
+      'echo "@abi=$(getprop ro.product.cpu.abi 2>/dev/null)"',
+      'echo "@selinux=$(getenforce 2>/dev/null)"',
+      'echo "@moddis=$(cat /proc/sys/kernel/modules_disabled 2>/dev/null)"',
+      'if [ -d /data/adb/ksu ] || [ -d /data/adb/ksud ]; then echo "@manager=KernelSU"; ' +
+        'elif [ -d /data/adb/ap ]; then echo "@manager=APatch"; ' +
+        'elif [ -d /data/adb/magisk ]; then echo "@manager=Magisk"; ' +
+        'else echo "@manager=Unknown"; fi',
+      'echo "@uid=$(id -u 2>/dev/null)"',
+      '[ -f ' + q(ko) + ' ] && echo "@ko=1" || echo "@ko=0"',
+      'echo "@lmod=$(awk \'$1=="lkmloader"{f=1} END{print f+0}\' /proc/modules 2>/dev/null)"',
+      'echo "@ctl_begin"',
+      'cat /proc/lkmctl 2>/dev/null',
+      'echo "@ctl_end"'
+    ].join('\n');
+
+    return global.Shell.exec(script, { timeout: 12000 }).then(function (res) {
+      var dev = {};
+      var ctl = {};
+      var inCtl = false;
+
+      res.out.split('\n').forEach(function (line) {
+        var t = line.replace(/\s+$/, '');
+        if (t === '@ctl_begin') { inCtl = true; return; }
+        if (t === '@ctl_end') { inCtl = false; return; }
+        if (inCtl) {
+          var i = t.indexOf('=');
+          if (i > 0) ctl[t.slice(0, i)] = t.slice(i + 1).trim();
+          return;
+        }
+        var m = t.match(/^@([a-z0-9_]+)=(.*)$/i);
+        if (m) dev[m[1]] = m[2].trim();
+      });
+
+      return { dev: dev, ctl: ctl };
+    });
+  }
+
+  function status() {
+    return resolveModDir().then(function () {
+      return probe();
+    }).then(function (p) {
+      var info = p.dev;
+      var ctl = p.ctl;
+      var kmi = kmiFromKernel(info.kernel);
+
+      state.device = info;
+      global.Shell.setDevice(info);
+
+      var ctlReadable = ctl.loader === 'lkmloader';
+      var inModules = info.lmod === '1';
+      var brand = (info.brand || '').replace(/^\w/, function (c) { return c.toUpperCase(); });
+      var model = info.model || '未知设备';
+      var device = brand && brand.toLowerCase() !== model.toLowerCase().split(' ')[0].toLowerCase()
+        ? brand + ' ' + model
+        : model;
+      if (info.abi) device += ' (' + info.abi + ')';
+
+      return {
+        /* /proc/lkmctl is the authoritative source, but a loaded module also
+           shows up in /proc/modules - if only the latter is true the loader
+           runs and the proc file is unreadable, which is not "not loaded" */
+        loaderUp: ctlReadable || inModules,
+        ctlReadable: ctlReadable,
+        koExists: info.ko === '1',
+        kernel: info.kernel || '—',
+        kmi: kmi,
+        device: device,
+        soc: info.soc2 || info.soc || '—',
+        android: info.android || '—',
+        abi: info.abi || '—',
+        selinux: info.selinux || '—',
+        manager: info.manager || 'Unknown',
+        uid: info.uid || '',
+        blocked: String(info.moddis) === '1',
+        symbols: parseInt(ctl.num_syms || '0', 10) || 0,
+        layout: ctl.layout != null ? ctl.layout : '',
+        loads: parseInt(ctl.loads || '0', 10) || 0,
+        fails: parseInt(ctl.fails || '0', 10) || 0,
+        seq: parseInt(ctl.seq || '0', 10) || 0,
+        cacheHits: parseInt(ctl.cache_hits || '0', 10) || 0,
+        cacheUsed: parseInt(ctl.cache_used || '0', 10) || 0,
+        symbolMode: ctl.symbol_mode === '1' ? 1 : 0,
+        loaderVersion: ctl.version || '',
+        lastTarget: ctl.last_target || '',
+        lastPatched: parseInt(ctl.last_patched || '0', 10) || 0,
+        lastNative: parseInt(ctl.last_native || '0', 10) || 0,
+        lastErrno: ctl.last_errno,
+        lastMsg: ctl.last_msg || ''
+      };
+    });
+  }
+
+  /* cheap tick for the poll: loader seq + liveness, nothing else */
+  function tick() {
+    var script = [
+      'awk \'$1=="lkmloader"{f=1} END{print "lmod=" f+0}\' /proc/modules 2>/dev/null',
+      'sed -n "s/^seq=//p" /proc/lkmctl 2>/dev/null | head -n1 | sed "s/^/seq=/"',
+      'sed -n "s/^loads=//p" /proc/lkmctl 2>/dev/null | head -n1 | sed "s/^/loads=/"',
+      'sed -n "s/^fails=//p" /proc/lkmctl 2>/dev/null | head -n1 | sed "s/^/fails=/"',
+      'sed -n "s/^num_syms=//p" /proc/lkmctl 2>/dev/null | head -n1 | sed "s/^/num_syms=/"',
+      'sed -n "s/^cache_used=//p" /proc/lkmctl 2>/dev/null | head -n1 | sed "s/^/cache_used=/"',
+      'sed -n "s/^cache_hits=//p" /proc/lkmctl 2>/dev/null | head -n1 | sed "s/^/cache_hits=/"',
+      'sed -n "s/^last_msg=//p" /proc/lkmctl 2>/dev/null | head -n1 | sed "s/^/last_msg=/"'
+    ].join('\n');
+
+    return global.Shell.exec(script, { timeout: 8000 }).then(function (res) {
+      var map = {};
+      res.out.split('\n').forEach(function (line) {
+        var i = line.indexOf('=');
+        if (i > 0) map[line.slice(0, i)] = line.slice(i + 1).trim();
+      });
+      return {
+        loaderUp: map.lmod === '1' || map.seq !== undefined,
+        ctlReadable: map.seq !== undefined,
+        seq: parseInt(map.seq || '0', 10) || 0,
+        loads: parseInt(map.loads || '0', 10) || 0,
+        fails: parseInt(map.fails || '0', 10) || 0,
+        symbols: parseInt(map.num_syms || '0', 10) || 0,
+        cacheUsed: parseInt(map.cache_used || '0', 10) || 0,
+        cacheHits: parseInt(map.cache_hits || '0', 10) || 0,
+        lastMsg: map.last_msg || ''
+      };
+    });
+  }
+
   function readCtl() {
-    return global.Shell.exec('cat /proc/lkmctl 2>/dev/null').then(function (res) {
+    return global.Shell.exec('cat /proc/lkmctl 2>/dev/null', { timeout: 8000 }).then(function (res) {
       var map = {};
       res.out.split('\n').forEach(function (line) {
         var i = line.indexOf('=');
@@ -179,107 +358,106 @@
     });
   }
 
-  function status() {
-    return Promise.all([
-      global.Shell.deviceInfo(),
-      loadConfig(),
-      readCtl(),
-      resolveModDir().then(function () {
-        return global.Shell.exists(state.modDir + '/ko/lkmloader.ko');
-      })
-    ]).then(function (r) {
-      var info = r[0], cfg = r[1], ctl = r[2], koExists = r[3];
-      var kmi = kmiFromKernel(info.kernel);
-      var loaderUp = ctl.loader === 'lkmloader';
-      var brand = (info.brand || '').replace(/^\w/, function (c) { return c.toUpperCase(); });
-      var model = info.model || '未知设备';
-      var device = brand && brand.toLowerCase() !== model.toLowerCase().split(' ')[0].toLowerCase()
-        ? brand + ' ' + model
-        : model;
-      if (info.abi) device += ' (' + info.abi + ')';
+  /* --------------------------------------------------------------- modules */
 
-      var compat = null;
+  function moduleEntries(cfg) {
+    var list = (cfg.modules || []).map(function (m) {
+      return Object.assign({}, m, { hot: false });
+    });
+    state.hot.forEach(function (h) {
+      var dup = list.some(function (m) { return kernelName(m.name) === kernelName(h.name); });
+      if (dup) return;
+      list.push({
+        name: h.name,
+        path: h.path,
+        args: h.args || '',
+        stage: 'manual',
+        enabled: false,
+        delay: 0,
+        hot: true
+      });
+    });
+    return list;
+  }
 
-      return {
-        loaderUp: loaderUp,
-        koExists: koExists,
-        kernel: info.kernel || '—',
-        kmi: kmi,
-        device: device,
-        soc: info.soc2 || info.soc || '—',
-        android: info.android || '—',
-        abi: info.abi || '—',
-        selinux: info.selinux || '—',
-        manager: info.manager || 'Unknown',
-        blocked: String(info.moddis) === '1',
-        symbols: parseInt(ctl.num_syms || '0', 10) || 0,
-        layout: ctl.layout != null ? ctl.layout : '',
-        loads: parseInt(ctl.loads || '0', 10) || 0,
-        fails: parseInt(ctl.fails || '0', 10) || 0,
-        seq: parseInt(ctl.seq || '0', 10) || 0,
-        cacheHits: parseInt(ctl.cache_hits || '0', 10) || 0,
-        cacheUsed: parseInt(ctl.cache_used || '0', 10) || 0,
-        symbolMode: ctl.symbol_mode === '1' ? 1 : 0,
-        loaderVersion: ctl.version || '',
-        lastTarget: ctl.last_target || '',
-        lastPatched: parseInt(ctl.last_patched || '0', 10) || 0,
-        lastNative: parseInt(ctl.last_native || '0', 10) || 0,
-        lastErrno: ctl.last_errno,
-        lastMsg: ctl.last_msg || '',
-        compat: compat
-      };
+  /* one awk pass over /proc/modules answers "which of these are loaded" */
+  function loadedSet(entries) {
+    if (!entries.length) return Promise.resolve({});
+
+    var want = [];
+    entries.forEach(function (m) {
+      nameVariants(m.name).forEach(function (v) {
+        if (want.indexOf(v) < 0) want.push(v);
+      });
+    });
+
+    var script = 'awk -v want=' + q(want.join(' ')) + ' \'BEGIN{' +
+      'n=split(want,a," "); for(i=1;i<=n;i++) w[a[i]]=1}' +
+      '{ name=$1; if (name in w) print name; gsub(/-/,"_",name); if (name in w) print name }\' ' +
+      '/proc/modules 2>/dev/null';
+
+    return global.Shell.exec(script, { timeout: 8000 }).then(function (res) {
+      var set = {};
+      res.out.split('\n').forEach(function (line) {
+        var k = line.trim();
+        if (k) set[k] = true;
+      });
+      return set;
     });
   }
 
-  /* --------------------------------------------------------------- modules */
+  /*
+   * vermagic is read once per file per session. .modinfo is a run of NUL
+   * terminated strings, so it is turned into lines first: anchoring on
+   * `^vermagic=` keeps module parameters such as ignore_vermagic out of the
+   * result, and `-m1` stops reading at the first hit. The plain grep is the
+   * fallback for images where tr trips over binary data.
+   */
+  function loadVermagic(entries) {
+    var todo = entries.filter(function (m) {
+      return m.path && state.vermagic[m.path] === undefined;
+    });
+    if (!todo.length) return Promise.resolve();
+
+    var script = todo.map(function (m) {
+      var f = q(m.path);
+      return 'echo "##' + m.path + '"; ' +
+        'v=$(tr "\\0" "\\n" <' + f + ' 2>/dev/null | grep -m1 \'^vermagic=\' | cut -d= -f2-); ' +
+        '[ -n "$v" ] || v=$(grep -a -o -m1 \'vermagic=[0-9][^ ]*\' ' + f + ' 2>/dev/null | cut -d= -f2-); ' +
+        'echo "$v"';
+    }).join('\n');
+
+    return global.Shell.exec(script, { timeout: 20000 }).then(function (res) {
+      var cur = null;
+      res.out.split('\n').forEach(function (line) {
+        var t = line.replace(/\r$/, '');
+        if (!t) return;                  /* the trailing newline would blank the last entry */
+        if (t.slice(0, 2) === '##') { cur = t.slice(2); state.vermagic[cur] = ''; return; }
+        if (cur && t.indexOf('vermagic=') !== 0) state.vermagic[cur] = t.trim();
+      });
+    }, function () { /* vermagic is a hint only, never fail the page on it */ });
+  }
+
+  function forgetVermagic(path) {
+    delete state.vermagic[path];
+  }
 
   function refreshModules() {
     return loadConfig().then(function (cfg) {
-      var mods = cfg.modules || [];
-      if (!mods.length) return [];
-
-      var check = mods.map(function (m) {
-        return nameVariants(m.name).map(function (n) {
-          return 'grep -q "^' + n + ' " /proc/modules 2>/dev/null && echo "' + m.name + ':1"';
-        }).join('\n');
-      }).join('\n');
-
-      var vm = mods.map(function (m) {
-        var f = q(m.path);
-        return 'echo "##' + m.name + '"; ' +
-          'v=$(strings -a ' + f + ' 2>/dev/null | grep -m1 "vermagic="); ' +
-          '[ -n "$v" ] || v=$(grep -a -o "vermagic=[^ ]*" ' + f + ' 2>/dev/null | head -n1); ' +
-          'echo "$v"';
-      }).join('\n');
-
-      return Promise.all([
-        global.Shell.exec(check + '\n' + vm),
-        global.Shell.deviceInfo()
-      ]).then(function (r) {
-        var out = r[0].out;
-        var info = r[1];
-        var kmi = kmiFromKernel(info.kernel);
-        var loaded = {};
-        var vermagic = {};
-        var cur = null;
-        out.split('\n').forEach(function (line) {
-          line = line.trim();
-          if (!line) return;
-          if (line.slice(0, 2) === '##') { cur = line.slice(2); vermagic[cur] = ''; return; }
-          if (/^[^:]+:[01]$/.test(line)) {
-            var p = line.split(':');
-            loaded[p[0]] = p[1] === '1';
-            return;
-          }
-          if (cur && line.indexOf('vermagic=') === 0) vermagic[cur] = line.slice(9);
-        });
-
-        return mods.map(function (m) {
-          var on = !!loaded[m.name];
-          return Object.assign({}, m, {
-            loaded: on,
-            vermagic: vermagic[m.name] || '',
-            _compatible: parseVermagic(vermagic[m.name], info.kernel, kmi)
+      var entries = moduleEntries(cfg);
+      return loadVermagic(entries).then(function () {
+        return loadedSet(entries);
+      }).then(function (set) {
+        return global.Shell.deviceInfo().catch(function () { return {}; }).then(function (info) {
+          var kmi = kmiFromKernel(info.kernel);
+          return entries.map(function (m) {
+            var loaded = nameVariants(m.name).some(function (v) { return !!set[v]; });
+            var vm = state.vermagic[m.path] || '';
+            return Object.assign({}, m, {
+              loaded: loaded,
+              vermagic: vm,
+              _compatible: parseVermagic(vm, info.kernel, kmi)
+            });
           });
         });
       });
@@ -288,8 +466,8 @@
 
   /* ---------------------------------------------------------------- actions */
 
-  function run(script) {
-    return global.Shell.exec(script);
+  function run(script, options) {
+    return global.Shell.exec(script, options);
   }
 
   function loaderScript(body) {
@@ -313,13 +491,238 @@
     return run(loaderScript('lkm_unload_one ' + q(m.name))).then(function (r) {
       var out = (r.out || '').trim();
       var m2 = out.match(/state=(\w+)(?::([\s\S]*))?/);
-      var state = m2 ? m2[1] : 'failed';
+      var st = m2 ? m2[1] : 'failed';
       return {
-        ok: state === 'unloaded' || state === 'absent',
-        state: state,
+        ok: st === 'unloaded' || st === 'absent',
+        state: st,
         out: out,
         err: m2 && m2[2] ? m2[2] : (r.err || '').trim()
       };
+    });
+  }
+
+  /*
+   * Hot load: hand any .ko to the loader straight from where it lies. Nothing
+   * is copied and nothing is written to config.json, so it disappears on
+   * reboot unless the user later adds it to the boot list.
+   */
+  function hotLoad(path, args) {
+    var name = kernelName(baseName(path));
+    return run(loaderScript(
+      'lkm_load_one ' + q(name) + ' ' + q(path) + ' ' + q(sanitizeArgs(args))
+    ), { timeout: 40000 }).then(function (r) {
+      var out = (r.out || '').trim();
+      var err = (r.err || '').trim();
+      var ok = r.code === 0;
+      if (ok) {
+        var exist = state.hot.filter(function (h) { return h.path === path; })[0];
+        if (exist) {
+          exist.args = sanitizeArgs(args);
+          exist.name = name;
+        } else {
+          state.hot.push({ name: name, path: path, args: sanitizeArgs(args) });
+        }
+        forgetVermagic(path);
+      }
+      return { ok: ok, name: name, out: out, err: err || (ok ? '' : out) };
+    });
+  }
+
+  /* unload anything currently in /proc/modules, hot or configured */
+  function unloadByName(name) {
+    return run(loaderScript('lkm_unload_one ' + q(name)), { timeout: 30000 }).then(function (r) {
+      var out = (r.out || '').trim();
+      var m = out.match(/state=(\w+)(?::([\s\S]*))?/);
+      var st = m ? m[1] : 'failed';
+      if (st !== 'failed') {
+        state.hot = state.hot.filter(function (h) {
+          return kernelName(h.name) !== kernelName(name);
+        });
+      }
+      return {
+        ok: st === 'unloaded' || st === 'absent',
+        state: st,
+        err: m && m[2] ? m[2] : (r.err || '').trim()
+      };
+    });
+  }
+
+  /* register a hot loaded file for boot without copying it into the module */
+  function addToBoot(path, args) {
+    return loadConfig().then(function (cfg) {
+      var name = kernelName(baseName(path));
+      var exist = cfg.modules.filter(function (m) { return kernelName(m.name) === name; })[0];
+      if (exist) {
+        exist.path = path;
+        exist.args = sanitizeArgs(args);
+        exist.enabled = true;
+      } else {
+        cfg.modules.push({
+          name: name,
+          path: path,
+          args: sanitizeArgs(args),
+          stage: cfg.defaultStage || 'service',
+          enabled: true,
+          delay: 0
+        });
+      }
+      return saveConfig(cfg).then(function () {
+        state.hot = state.hot.filter(function (h) { return kernelName(h.name) !== name; });
+        return { name: name };
+      });
+    });
+  }
+
+  /* every module the kernel currently has, for the "loaded" sheet */
+  function loadedModules() {
+    var script = 'awk \'{ printf "%s\\037%s\\037%s\\037%s\\037%s\\n", $1, $2, $3, $4, $5 }\' ' +
+      '/proc/modules 2>/dev/null';
+
+    return global.Shell.exec(script, { timeout: 10000 }).then(function (res) {
+      var rows = [];
+      res.out.split('\n').forEach(function (line) {
+        if (!line) return;
+        var p = line.split('\u001f');
+        if (p.length < 5) return;
+        rows.push({
+          name: p[0],
+          size: parseInt(p[1], 10) || 0,
+          refs: parseInt(p[2], 10) || 0,
+          deps: p[3] === '-' ? '' : p[3],
+          modState: p[4]
+        });
+      });
+      rows.sort(function (a, b) { return a.name.localeCompare(b.name, 'en'); });
+      return rows;
+    });
+  }
+
+  /* ---------------------------------------------------------------- upload */
+
+  var HOT_DIR = '/data/local/tmp/lkm_hot';
+
+  function bytesToBase64(bytes) {
+    var step = 0x8000;
+    var out = '';
+    for (var i = 0; i < bytes.length; i += step) {
+      out += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+    }
+    return global.btoa(out);
+  }
+
+  /* a file picked through the Android chooser is a content:// blob: no path,
+     so the bytes are checked here before anything touches the device */
+  function readBlob(file) {
+    if (!file) return Promise.reject(new Error('没有选择文件'));
+    return file.arrayBuffer().then(function (buf) {
+      var bytes = new Uint8Array(buf);
+      if (bytes.length < 4096 || bytes.length > 67108864) {
+        throw new Error('文件大小异常（' + bytes.length + ' 字节）');
+      }
+      if (!(bytes[0] === 0x7f && bytes[1] === 0x45 && bytes[2] === 0x4c && bytes[3] === 0x46)) {
+        throw new Error('不是有效的 ELF 文件');
+      }
+      if (bytes[4] !== 2) throw new Error('不是 64 位 ELF');
+      if (bytes[16] !== 1) throw new Error('不是可重定位目标（ET_REL），可能不是内核模块');
+      return bytes;
+    });
+  }
+
+  /*
+   * base64 in 32 KB appends, decoded on the device, then the byte count is
+   * read back. One command per chunk keeps every exec well below any bridge
+   * or argv limit.
+   */
+  function uploadBlob(bytes, dest) {
+    var tmp = dest + '.b64';
+    var b64 = bytesToBase64(bytes);
+    var CHUNK = 32000;
+    var parts = [];
+    for (var i = 0; i < b64.length; i += CHUNK) parts.push(b64.slice(i, i + CHUNK));
+
+    return global.Shell.exec(
+      'mkdir -p ' + q(dest.replace(/\/[^/]+$/, '')) + '\n: > ' + q(tmp)
+    ).then(function () {
+      return parts.reduce(function (chain, part) {
+        return chain.then(function () {
+          return global.Shell.exec('printf %s ' + q(part) + ' >> ' + q(tmp), { timeout: 20000 })
+            .then(function (r) {
+              if (r.code !== 0) throw new Error((r.err || '写入失败').trim());
+            });
+        });
+      }, Promise.resolve());
+    }).then(function () {
+      return global.Shell.exec(
+        'base64 -d ' + q(tmp) + ' > ' + q(dest) + ' 2>/dev/null; ' +
+        'rm -f ' + q(tmp) + '; stat -c %s ' + q(dest) + ' 2>/dev/null'
+      );
+    }).then(function (r) {
+      var size = parseInt((r.out || '').trim(), 10) || 0;
+      if (size !== bytes.length) {
+        throw new Error('写入校验失败（' + size + '/' + bytes.length + ' 字节）');
+      }
+      forgetVermagic(dest);
+      return { path: dest, size: size };
+    });
+  }
+
+  /* import: keep the file in the module, add it to the boot list */
+  function importBlob(file) {
+    var base = sanitizeName(file && file.name ? file.name : 'module');
+
+    return readBlob(file).then(function (bytes) {
+      return resolveModDir().then(function () {
+        var dest = state.modDir + '/lkm/' + base + '.ko';
+        return uploadBlob(bytes, dest).then(function (up) {
+          return loadConfig().then(function (cfg) {
+            var exist = cfg.modules.filter(function (m) { return nameVariants(m.name).indexOf(base) >= 0; })[0];
+            if (exist) {
+              exist.path = up.path;
+              exist.enabled = true;
+            } else {
+              cfg.modules.push({
+                name: base,
+                path: up.path,
+                args: '',
+                stage: cfg.defaultStage || 'service',
+                enabled: true,
+                delay: 0
+              });
+            }
+            return saveConfig(cfg).then(function () {
+              return { name: base, path: up.path, replaced: !!exist, size: up.size };
+            });
+          });
+        });
+      });
+    });
+  }
+
+  /*
+   * hot load: the picked file is dropped in /data/local/tmp and handed to the
+   * loader from there. Nothing is added to config.json, so it is gone after a
+   * reboot unless the user keeps it from the module card.
+   */
+  function hotLoadBlob(file) {
+    var base = sanitizeName(file && file.name ? file.name : 'module');
+
+    return readBlob(file).then(function (bytes) {
+      return uploadBlob(bytes, HOT_DIR + '/' + base + '.ko').then(function (up) {
+        var name = kernelName(base);
+        return run(loaderScript(
+          'lkm_load_one ' + q(name) + ' ' + q(up.path) + " ''"
+        ), { timeout: 40000 }).then(function (r) {
+          var out = (r.out || '').trim();
+          var err = (r.err || '').trim();
+          var ok = r.code === 0;
+          if (ok) {
+            var exist = state.hot.filter(function (h) { return h.path === up.path; })[0];
+            if (exist) exist.name = name;
+            else state.hot.push({ name: name, path: up.path, args: '' });
+          }
+          return { ok: ok, name: name, path: up.path, out: out, err: err || (ok ? '' : out) };
+        });
+      });
     });
   }
 
@@ -356,7 +759,7 @@
         'echo "syms=$(lkm_ctl_get num_syms)"',
         'echo "version=$(lkm_ctl_get version)"',
         'echo "mode=$(lkm_ctl_get symbol_mode)"'
-      ].join('\n')));
+      ].join('\n')), { timeout: 40000 });
     }).then(function (r) {
       var out = r.out || '';
       var pick = function (key) {
@@ -378,7 +781,8 @@
   function logs() {
     return global.Shell.exec(
       'cat /proc/lkmlog 2>/dev/null; echo "@@BOOT@@"; ' +
-      'tail -n 40 ' + q(state.modDir + '/logs/boot.log') + ' 2>/dev/null'
+      'tail -n 40 ' + q(state.modDir + '/logs/boot.log') + ' 2>/dev/null',
+      { timeout: 12000 }
     ).then(function (r) {
       var parts = r.out.split('@@BOOT@@');
       return {
@@ -437,7 +841,8 @@
           elf: '不是有效的 ELF 文件',
           class: '不是 64 位 ELF',
           type: '不是可重定位目标（ET_REL），可能不是内核模块',
-          arch: '架构不匹配：文件 ' + extra + '，设备 ' + (window.navigator.platform || '')
+          arch: '架构不匹配：文件 ' + extra + '，设备 ' +
+            ((global.navigator && global.navigator.platform) || '')
         }[kind] || '导入失败';
         if (kind === 'copy') why = '复制失败，请检查权限或存储空间';
         if (kind === 'verify') why = '复制校验失败（大小不一致）';
@@ -459,6 +864,7 @@
             delay: 0
           });
         }
+        forgetVermagic(dest);
         return saveConfig(cfg).then(function () {
           return { name: base, path: dest, replaced: !!exist };
         });
@@ -480,12 +886,17 @@
       var target = cfg.modules.filter(function (m) { return m.name === name; })[0];
       cfg.modules = cfg.modules.filter(function (m) { return m.name !== name; });
       return saveConfig(cfg).then(function () {
-        if (target) {
-          var unload = nameVariants(target.name).map(function (n) {
-            return 'grep -q "^' + n + ' " /proc/modules 2>/dev/null && rmmod ' + q(n) + ' 2>/dev/null';
-          }).join('\n');
-          return run(unload + '\nrm -f ' + q(target.path) + ' 2>/dev/null; echo ok');
-        }
+        if (!target) return;
+        /* only files the module itself copied may be deleted; a hot loaded
+           module still lives wherever the user picked it */
+        var owned = target.path && target.path.indexOf(state.modDir + '/') === 0;
+        var unload = nameVariants(target.name).map(function (n) {
+          return 'grep -q "^' + n + ' " /proc/modules 2>/dev/null && rmmod ' + q(n) + ' 2>/dev/null';
+        }).join('\n');
+        var lines = [unload];
+        if (owned) lines.push('rm -f ' + q(target.path) + ' 2>/dev/null');
+        lines.push('echo ok');
+        return run(lines.join('\n')).then(function () { return { removedFile: !!owned }; });
       });
     });
   }
@@ -550,31 +961,45 @@
 
   function demo() {
     var cfg = clone(demoConfig);
+    var demoLoaded = [
+      { name: 'droid_lkm', size: 184320, refs: 0, deps: '', modState: 'Live' },
+      { name: 'lkmloader', size: 347112, refs: 0, deps: '', modState: 'Live' },
+      { name: 'wlan', size: 9124864, refs: 1, deps: 'cfg80211', modState: 'Live' }
+    ];
+
     return {
       demo: true,
       isDemo: true,
       humanSize: humanSize,
       sanitizeName: sanitizeName,
+      kernelName: kernelName,
+      baseName: baseName,
+      sanitizeArgs: sanitizeArgs,
       kmiFromKernel: kmiFromKernel,
       status: function () {
         return Promise.resolve({
-          loaderUp: true, koExists: true,
+          loaderUp: true, ctlReadable: true, koExists: true,
           kernel: '6.12.69-android16-6-g43b5ab7e247d-abogki61813157-4k',
           kmi: 'android16-6.12',
           device: 'Xiaomi 23127PN0CC (arm64-v8a)',
           soc: 'sun', android: '16', abi: 'arm64-v8a', selinux: 'Enforcing',
-          manager: 'KernelSU', blocked: false,
+          manager: 'KernelSU', uid: '0', blocked: false,
           symbols: 142103, layout: '2', loads: 1, fails: 0, seq: 7,
           cacheUsed: 38, cacheHits: 12,
-          symbolMode: 0, loaderVersion: '1.2.0', lastTarget: 'droid_lkm.ko',
+          symbolMode: 0, loaderVersion: '1.2.6', lastTarget: 'droid_lkm.ko',
           lastPatched: 11, lastNative: 6,
-          lastErrno: '0', lastMsg: 'loaded droid_lkm.ko (patched 11, native 6)',
-          compat: true
+          lastErrno: '0', lastMsg: 'loaded droid_lkm.ko (patched 11, native 6)'
+        });
+      },
+      tick: function () {
+        return Promise.resolve({
+          loaderUp: true, ctlReadable: true, seq: 7, loads: 1, fails: 0,
+          symbols: 142103, cacheUsed: 38, cacheHits: 12, lastMsg: 'demo'
         });
       },
       ctl: function () {
         return Promise.resolve({
-          loader: 'lkmloader', version: '1.2.0', num_syms: '142103',
+          loader: 'lkmloader', version: '1.2.6', num_syms: '142103',
           layout: '2', seq: '7', loads: '1', fails: '0', symbol_mode: '0',
           cache_used: '38', cache_hits: '12', cache_misses: '94',
           last_target: 'droid_lkm.ko', last_patched: '11', last_native: '6',
@@ -585,6 +1010,7 @@
       modules: function () {
         return Promise.resolve(cfg.modules.map(function (m, i) {
           return Object.assign({}, m, {
+            hot: false,
             loaded: i === 0,
             vermagic: '6.12.69-android16-6-g43b5ab7e247d SMP preempt mod_unload modversions aarch64',
             _compatible: true
@@ -598,8 +1024,16 @@
       loadOne: function () { return Promise.resolve({ ok: true, out: 'demo' }); },
       unloadOne: function () { return Promise.resolve({ ok: true, state: 'unloaded', out: 'state=unloaded' }); },
       reloadOne: function () { return Promise.resolve({ ok: true, out: 'demo' }); },
+      hotLoad: function (path) {
+        return Promise.resolve({ ok: true, name: sanitizeName(path.split('/').pop()), out: 'demo' });
+      },
+      unloadByName: function () { return Promise.resolve({ ok: true, state: 'unloaded' }); },
+      addToBoot: function (path) {
+        return Promise.resolve({ name: sanitizeName(path.split('/').pop()) });
+      },
+      loadedModules: function () { return Promise.resolve(demoLoaded.slice()); },
       restartLoader: function () {
-        return Promise.resolve({ ok: true, up: true, syms: 142103, version: '1.2.0', mode: '0', out: 'state=up' });
+        return Promise.resolve({ ok: true, up: true, syms: 142103, version: '1.2.6', mode: '0', out: 'state=up' });
       },
       clearLog: function () { demoLogs.loader = ''; return Promise.resolve(); },
       sanitizeArgs: sanitizeArgs,
@@ -623,20 +1057,18 @@
         });
       },
       meta: function () {
-        return Promise.resolve({ id: 'lkmloader', version: 'v1.2.0', name: 'LKM Loader' });
+        return Promise.resolve({ id: 'lkmloader', version: 'v1.2.6', name: 'LKM Loader' });
       },
-      listDir: function (path) {
-        var rows = path === '/sdcard/Download' ? [
-          { type: 'dir', size: 0, name: 'Magisk' },
-          { type: 'file', size: 188416, name: 'droid_lkm.ko' },
-          { type: 'file', size: 92160, name: 'kpatch_probe.ko' },
-          { type: 'file', size: 4211, name: 'readme.txt' }
-        ] : [
-          { type: 'dir', size: 0, name: 'Download' },
-          { type: 'dir', size: 0, name: 'Android' },
-          { type: 'file', size: 51200, name: 'demo.ko' }
-        ];
-        return Promise.resolve(rows);
+      importBlob: function (file) {
+        return Promise.resolve({ name: sanitizeName(file && file.name), path: '/lkm', replaced: false, size: 1 });
+      },
+      hotLoadBlob: function (file) {
+        return Promise.resolve({
+          ok: true,
+          name: sanitizeName(file && file.name),
+          path: '/data/local/tmp/lkm_hot/x.ko',
+          out: 'demo'
+        });
       }
     };
   }
@@ -645,11 +1077,15 @@
     isDemo: !global.Shell.available,
     resolveModDir: resolveModDir,
     get modDir() { return state.modDir; },
+    get hot() { return state.hot; },
     kmiFromKernel: kmiFromKernel,
     humanSize: humanSize,
     sanitizeName: sanitizeName,
     sanitizeArgs: sanitizeArgs,
+    baseName: baseName,
+    kernelName: kernelName,
     status: status,
+    tick: tick,
     ctl: readCtl,
     modules: refreshModules,
     loadConfig: loadConfig,
@@ -658,12 +1094,24 @@
     loadOne: loadOne,
     unloadOne: unloadOne,
     reloadOne: reloadOne,
+    hotLoad: function (path, args) {
+      return resolveModDir().then(function () { return hotLoad(path, args); });
+    },
+    unloadByName: function (name) {
+      return resolveModDir().then(function () { return unloadByName(name); });
+    },
+    addToBoot: function (path, args) {
+      return resolveModDir().then(function () { return addToBoot(path, args); });
+    },
+    loadedModules: loadedModules,
     restartLoader: restartLoader,
     logs: logs,
     clearLog: clearLog,
     importKo: function (src, name) {
       return resolveModDir().then(function () { return importKo(src, name); });
     },
+    importBlob: importBlob,
+    hotLoadBlob: hotLoadBlob,
     updateModule: function (name, patch) {
       return loadConfig().then(function () { return updateModule(name, patch); });
     },
@@ -676,10 +1124,7 @@
     saveDefaultStage: function (stage) {
       return loadConfig().then(function () { return saveDefaultStage(stage); });
     },
-    meta: meta,
-    listDir: function (path) {
-      return global.Shell.listDir(path);
-    }
+    meta: meta
   };
 
   global.LKM = global.Shell.available ? api : demo();

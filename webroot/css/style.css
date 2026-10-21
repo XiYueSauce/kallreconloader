@@ -482,42 +482,6 @@ code, .num { font-family: var(--mono); }
   stroke-linecap: round;
 }
 
-.crumb {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0 12px;
-  padding: 8px 10px;
-  background: var(--bg);
-  border-radius: 10px;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--label);
-}
-.crumb span {
-  overflow-x: auto;
-  white-space: nowrap;
-  scrollbar-width: none;
-}
-.crumb span::-webkit-scrollbar { display: none; }
-
-.quick {
-  display: flex;
-  gap: 8px;
-  padding: 10px 12px 4px;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-.quick::-webkit-scrollbar { display: none; }
-.quick button {
-  flex: 0 0 auto;
-  font-size: 12px;
-  padding: 6px 11px;
-  border-radius: 8px;
-  border: 1px solid var(--line-strong);
-  color: var(--label);
-}
-
 .filter-row {
   display: flex;
   align-items: center;
@@ -628,3 +592,93 @@ code, .num { font-family: var(--mono); }
   animation: toastIn 0.2s ease;
 }
 @keyframes toastIn { from { opacity: 0; transform: translate(-50%, 6px); } to { opacity: 1; transform: translateX(-50%); } }
+
+/* ------------------------------------------------ hot load / loaded sheet */
+
+.head-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+
+#st-hint { padding: 0 2px; }
+
+
+.search {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  border-radius: 9px;
+  border: 1px solid var(--line-strong);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  padding: 0 10px;
+  outline: none;
+  -webkit-appearance: none;
+}
+.search:focus { border-color: var(--accent); }
+.search::placeholder { color: var(--muted); }
+
+#sheet-loaded .filelist { max-height: 50vh; }
+/* body copy inside a sheet needs the same side margin as the rows */
+.sheet > .note { padding: 10px 16px 4px; }
+
+.note.small { font-size: 12px; color: var(--muted); line-height: 1.55; }
+
+.file[disabled] { opacity: 0.5; pointer-events: none; }
+
+/* the sheet is a fixed budget flex column: the chrome keeps its size and only
+   the file list may shrink. Without this a long list squeezes the header rows
+   and the footer into each other. */
+.sheet { overflow: hidden; }
+
+.sheet > .sheet-grip,
+.sheet > .sheet-head,
+.sheet > .filter-row,
+.sheet > .note,
+.sheet > .sheet-foot { flex: 0 0 auto; }
+
+.sheet .filelist { flex: 1 1 auto; min-height: 0; }
+
+.btn.wide { width: 100%; }
+.desc.spaced { margin-top: 10px; }
+
+/* landscape / split screen: the sheet budget gets tight, so drop the hint and
+   tighten the chrome instead of letting the file list collapse to nothing */
+@media (max-height: 620px) {
+  .sheet { max-height: 94vh; }
+  .sheet > .filter-row { padding: 6px 16px; }
+  .sheet > .note { display: none; }
+  .sheet > .sheet-foot { padding: 8px 16px 2px; }
+  .file { padding: 9px 16px; }
+}
+
+/* only reserve list height when the budget can pay for it */
+@media (min-height: 421px) and (max-height: 620px) {
+  .sheet .filelist { min-height: 96px; }
+}
+
+@media (max-height: 420px) {
+  .sheet .filelist { min-height: 72px; }
+}
+
+/* absurdly short (a few hundred px): keep the footer on screen, the list can
+   scroll even in a sliver */
+@media (max-height: 300px) {
+  .sheet .filelist { min-height: 0; }
+}
+
+/* the android file chooser input stays in the DOM but out of sight: some
+   WebViews refuse click() on a display:none input */
+.file-input {
+  position: fixed;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* name + "本模块" chip on one line, the name still ellipsizes */
+.file .name-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.file .name-row .name { min-width: 0; }
+
+/* the right hand status of a row must never be squeezed out of the sheet */
+.file > .sz.right { flex: 0 0 auto; white-space: nowrap; }

@@ -88,7 +88,45 @@ chmod -R 0755 "$STAGE/common" "$STAGE/webroot"
 
 mkdir -p dist
 rm -f "dist/$NAME.zip"
-(cd "$STAGE" && zip -r9 "../../dist/$NAME.zip" . -x '.*' >/dev/null)
+
+# `zip` is missing on plenty of Windows shells, so fall back to python and keep
+# the exec bits that the installer needs
+make_zip() {
+	src=$1
+	out=$2
+	if command -v zip >/dev/null 2>&1; then
+		(cd "$src" && zip -r9 "$out" . -x '.*' >/dev/null)
+		return
+	fi
+
+	py=
+	for c in python3 python; do
+		if command -v "$c" >/dev/null 2>&1; then
+			py=$c
+			break
+		fi
+	done
+	[ -n "$py" ] || die "need zip or python3 to package"
+
+	"$py" - "$src" "$out" <<'PY'
+import os, stat, sys, zipfile
+
+src, out = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+    for root, _dirs, files in os.walk(src):
+        for name in files:
+            full = os.path.join(root, name)
+            arc = os.path.relpath(full, src).replace(os.sep, '/')
+            exec_bit = name.endswith('.sh') or name == 'update-binary'
+            info = zipfile.ZipInfo(arc, date_time=(2026, 1, 1, 0, 0, 0))
+            info.external_attr = (stat.S_IFREG | (0o755 if exec_bit else 0o644)) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            with open(full, 'rb') as fh:
+                z.writestr(info, fh.read())
+PY
+}
+
+make_zip "$(pwd)/$STAGE" "$(pwd)/dist/$NAME.zip"
 
 # ------------------------------------------------------- verify the zip itself
 need="module.prop customize.sh post-fs-data.sh service.sh uninstall.sh
@@ -96,7 +134,11 @@ webroot/index.html webroot/css/style.css webroot/js/app.js webroot/js/lkm.js
 webroot/js/shell.js common/funcs.sh
 META-INF/com/google/android/update-binary META-INF/com/google/android/updater-script"
 
-listing=$(unzip -Z1 "dist/$NAME.zip")
+listing=$(unzip -Z1 "dist/$NAME.zip" 2>/dev/null || python3 -c "
+import sys, zipfile
+print('\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))
+" "dist/$NAME.zip")
+[ -n "$listing" ] || die "cannot read back dist/$NAME.zip"
 for f in $need; do
 	case "$listing" in
 	*"$f"*) ;;
