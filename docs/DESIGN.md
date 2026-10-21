@@ -235,7 +235,7 @@ lkm_json_bool() # "key":true
 
 | 文件 | 职责 | 关键点 |
 | --- | --- | --- |
-| `shell.js` | 桥接探测、`exec`、文件读写、目录枚举、设备信息 | 统一 `{code,out,err}`，30s 超时，heredoc 写文件（免 base64） |
+| `shell.js` | 桥接探测、`exec`、文件读写、设备信息 | 统一 `{code,out,err}`，兼容回调与 Promise 两代接口，heredoc 写文本文件 |
 | `lkm.js` | 领域层：模块目录、config.json、状态聚合、加载/卸载/重载、日志 | 真实实现与 demo 实现同一套接口 |
 | `app.js` | 渲染与交互：三个视图、两个 sheet、轮询、toast | 无框架，纯 DOM，`textContent` 渲染避免注入；所有内核操作走 `guard()` 串行化 |
 
@@ -244,35 +244,28 @@ lkm_json_bool() # "key":true
 
 桥接按顺序探测：`ksu` → `apatch` → `kernelsu` → `magisk` → `ksuwebui` → `mmrl`；一个都没有时切到 **demo 模式**（顶部橙色条提示），以便在普通浏览器里调样式——截图即此模式。
 
-### 5.2 文件浏览器
+### 5.2 导入与热加载
 
-不用 `<input type="file">`（WebUI 里拿不到真实路径），而是用 shell 遍历：
+两个入口都走 `<input type="file">`（Android 系统选择器，第三方文件管理器能接管就由它接管），
+区别只在落盘位置：
 
-```sh
-cd "$dir"
-for f in * .[!.]*; do
-  [ -e "$f" ] || continue
-  if [ -d "$f" ]; then t=d; else t=f; fi
-  s=$(stat -c %s "$f")
-  printf '%s\037%s\037%s\n' "$t" "$s" "$f"
-done
-```
+| 入口 | 落盘 | 写 `config.json` |
+| --- | --- | --- |
+| 导入 .ko | `lkm/<name>.ko` | 是，随模块开机加载 |
+| 热加载 | `/data/local/tmp/lkm_hot/<name>.ko` | 否，重启失效 |
 
-字段分隔用 `\037`（unit separator）而不是 `|`，因为文件名里允许出现竖线。
-前端排序（目录优先）、`仅显示 .ko` 过滤、快捷入口（Download / 内部存储 / local/tmp / modules）、手动输入路径兜底。
-
-导入是一串**可校验的静态检查**，任何一步失败都会给出具体原因：
+`content://` 拿不到真实路径，所以字节先在前端校验，再以 base64 分段（32 KB 一次）追加写入，
+设备端 `base64 -d` 落地，最后回读字节数比对：
 
 | 检查 | 依据 |
 | --- | --- |
-| 文件存在、可 stat | `[ -f ]` / `stat -c %s` |
 | 大小合理 | 4 KB ~ 64 MB |
+| ELF 魔数 | `7f 45 4c 46` |
 | ELF64 | `e_ident[EI_CLASS] == 2` |
 | 可重定位对象 | `e_type == ET_REL` |
-| 架构匹配 | `e_machine` 对 `uname -m`（aarch64 `0xB7`） |
-| 复制完整 | 目标文件大小与源一致 |
+| 落盘完整 | `stat -c %s` 等于原始字节数 |
 
-重名导入会先确认覆盖；导入成功后立即尝试加载一次，失败会明确提示而不是只显示“已导入”。
+导入成功后立即尝试加载一次，失败会明确提示而不是只显示“已导入”。
 Vermagic / modversions 只作为**静态提示**显示，不作为“能加载”的结论。
 
 ### 5.3 视觉规范（对齐参考图）
@@ -292,13 +285,15 @@ Vermagic / modversions 只作为**静态提示**显示，不作为“能加载�
 
 ### 5.4 截图
 
-| 状态 | 模块 | 文件浏览器 |
-| --- | --- | --- |
-| ![](preview-final-status.png) | ![](preview-modules.png) | ![](preview-picker2.png) |
+演示模式（无桥接时页面自己造数据，便于在浏览器里调样式）下的真机版式：
 
-| 设置 | 模块详情 | 日志 |
+| 状态 | 模块 | 已加载 |
 | --- | --- | --- |
-| ![](preview-settings.png) | ![](preview-detail.png) | ![](preview-logs.png) |
+| ![](preview-status.png) | ![](preview-modules.png) | ![](preview-loaded.png) |
+
+| 设置 | 模块详情 |
+| --- | --- |
+| ![](preview-settings.png) | ![](preview-detail.png) |
 
 ---
 
@@ -329,9 +324,9 @@ Makefile 的两个细节：
 - `deps/KallRecon/deps.mk` 提供 `DEPS_LIB_OBJS`（含 `lib/anchor.o`，锚点汇编按 arch 自选），用 `addprefix` 挂到模块对象里
 - 6.10+ 内核把源文件规则从 `$(src)` 改成 `$(obj)`，因此显式补了 `$(obj)/%.o: $(src)/%.c` 与 `.S` 两条规则（否则 android16-6.12 上找不到源文件）
 
-CI：`.github/workflows/build.yml` 分三段——`check`（依赖部署 + 静态检查）、`build`（6 个 KMI 的矩阵任务并行）、
+CI：`.github/workflows/build.yml` 分三段——`check`（依赖部署 + 静态检查）、`build`（7 个 KMI 的矩阵任务并行：5.10 的 12/13、5.15、6.1、6.6、6.12、6.18）、
 `package`（汇总产物、校验、打包，tag 时发 Release）。矩阵化的收益是失败只影响单个 KMI，
-且总时长等于最慢的单个构建而不是六个之和；`concurrency` 会取消同分支被覆盖的旧运行。
+且总时长等于最慢的单个构建而不是全部之和；`concurrency` 会取消同分支被覆盖的旧运行。
 
 ---
 
@@ -461,7 +456,77 @@ CI：`.github/workflows/build.yml` 分三段——`check`（依赖部署 + 静�
 
 ---
 
-## 12. 参考
+## 12. WebUI 设计（现状）
+
+### 12.1 桥接：两种 exec 形态都要吃
+
+管理器的 WebUI 接口有两代。KernelSU 原生是**回调式**：`exec(cmd, opts, callbackName)`，
+第三个参数是全局回调函数名，函数本身返回 `undefined`；KsuWebUI / MMRL 则返回 Promise。
+只认 Promise 会把 `undefined` 当成结果，解析出 `{code:0,out:''}`——所有 `cat /proc/lkmctl`、
+`getprop` 都成了空串，界面就会报「未加载 / 未知设备」，而 loader 其实在跑。
+
+所以：调用时永远带第三个参数；返回值是 thenable 就走 Promise 路径，否则等回调。
+回调兼容 `(errno, stdout, stderr)`、单个结果对象、JSON 字符串三种形态。
+桥接既不回话也不返回 Promise 时抛 `TIMEOUT`，界面明确写「无法读取」，而不是把「读不到」
+伪装成「没加载」。
+
+### 12.2 加载判定：两个来源
+
+`/proc/lkmctl` 是权威来源，但它可能因权限或 SELinux 读不到。现在
+`loaderUp = /proc/lkmctl 里有 loader=lkmloader` **或** `/proc/modules` 里有 `lkmloader`。
+只有后者成立时状态卡注明「已加载，但 ctl 读不到」，符号/缓存数字沿用上一次的值而不是归零。
+
+### 12.3 少开 shell、少重建 DOM
+
+- 状态页一次 exec 拿全：设备属性 + `/proc/lkmctl` + `ko` 是否存在 + `/proc/modules` 命中结果。
+- `resolveModDir()` / `loadConfig()` 缓存的是 Promise，并发调用只跑一次。
+- 轮询（6 s）只读一次计数器；`seq` 没变就不拉日志、不重建 DOM。
+- vermagic 每个文件只解析一次并缓存；读取用 `tr '\0' '\n' | grep -m1 '^vermagic='`，
+  比 `strings` 全文扫描快，也不会被 `ignore_vermagic=%d` 那个参数串误导。
+- 日志区先比内容再重建；用户往上翻看时不强制滚到底；切 tab 不再触发请求。
+
+### 12.4 导入：系统文件选择器 + base64 分段落盘
+
+`<input type="file">` 在 WebView 里会拉起 Android 的选择器，第三方文件管理器也能接管，
+页面里不再需要一棵目录树。`content://` 没有路径，于是字节走前端校验 → base64 每 32 KB 追加 →
+设备端 `base64 -d` 落地 → 回读字节数比对。检查项见 §5.2。
+
+隐藏 input 用 `position: fixed; left: -9999px`，不用 `display: none`：部分 WebView 会拒绝
+在不可见元素上触发选择器。
+
+### 12.5 热加载与「已加载」
+
+- 热加载复用同一套字节流，只落到 `/data/local/tmp/lkm_hot/<name>.ko`，交给 `lkm_load_one`，
+  配置一个字不写；会话内记一条临时条目，可卸载，也可「加入开机」转正。
+- 「已加载」读 `/proc/modules`（一次 awk），本模块管理的名字排最前并标「本模块」，
+  `refcount > 0` 与 loader 自身禁用卸载；卸载走 `lkm_unload_one`，对非本模块加载的 LKM 同样有效。
+- 列表只看内核当前状态。文件躺在 `/data/adb/modules` 或 Download 里不代表它被加载过，
+  所以不做文件系统扫描。
+
+### 12.6 sheet 的高度预算
+
+`.sheet` 是 flex 列 + `max-height: 88vh`，内容超预算时如果让所有子元素一起缩，头部行和底部按钮
+会互相压住。现在 chrome（head / filter-row / note / foot）一律 `flex: 0 0 auto`，
+只有 `.filelist` 可伸缩且 `min-height: 0`，sheet 自身 `overflow: hidden`；
+矮屏用媒体查询收紧间距并隐藏说明，极矮屏只保证底部按钮可见。
+
+### 12.7 关于 “unresolved symbol” 这类失败
+
+strict 模式下 loader 遇到补不上的符号会直接 abort。这类符号既不在 kallsyms，也不是任何已加载模块
+导出的，所以**任何** loader 都补不了——绝大多数情况是目标 ko 少链了依赖库的对象文件
+（HooKern 这种按组拆分的库最容易踩）。
+
+实际案例：MountHide 的 `mhsrc.ko` 只链了 core / patch / ptr / kprobe / kretprobe 七个对象，
+却没给 `-DHK_NO_INLINE -DHK_NO_REDIR -DHK_NO_SIGHOOK`。而 `hk.c` 的 `hk_exit()` 与
+`hk_exit_block()` 无条件调用各组，于是 `hk_inline_exit`、`hk_inline_pending`、`hk_redir_pending`、
+`hk_redir_inflight`、`hk_sighook_exit` 五个引用悬空，`modpost` 若只当警告放过，产物就是坏的。
+
+结论：不要为了让它加载而关掉 `strict_symbols`，那只是把 0 当函数指针，退出路径必崩。
+正确做法是在构建端补对象文件，或补齐 `HK_NO_*` 让核心不再调用这些组。
+
+---
+
+## 13. 参考
 
 - [KallRecon](https://github.com/Dere3046/KallRecon) — kallsyms 重建（`doc/API.md` 是主要依据）
 - [KMSDK](https://github.com/Dere3046/KMSDK) — `deps.lst` / `.sdk-version` / `scripts/sdk` 约定

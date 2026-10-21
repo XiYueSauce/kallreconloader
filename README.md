@@ -26,11 +26,15 @@ lkmloader.ko ── KallRecon 重建 kallsyms ── patch 目标 ko 的 SHN_UND
   带 `__versions` 条目的符号说明它链接时是导出的，默认**交还内核**自行解析并做 CRC 校验，
   只有非导出符号才由 loader 回填（`symbol_mode=0`，可在设置里改成全量回填）。
   注意：不带内核 Module.symvers 编出来的 ko，`__versions` 是空的，此时两种模式等价。
-  注意：不带内核 Module.symvers 编出来的 ko，`__versions` 是空的，此时两种模式等价。
 - **常驻 loader + /proc 控制**：`/proc/lkmctl` 收命令与状态，`/proc/lkmlog` 输出环形日志，
   UI 可实时看到“解析了多少符号、缺了哪些、返回码是多少”。
 - **两种加载时机**：每个 ko 可单独选择 `post-fs-data` / `service` / 手动，支持延迟秒数。
-- **WebUI**：状态面板、模块管理、设备目录浏览导入、参数与开关、日志查看；HTML/CSS/JS 分离。
+- **热挂载 / 热卸载**：任选一个 `.ko` 直接挂进运行中的内核（只落到 `/data/local/tmp`，不写配置，
+  重启即失效，需要的话一键「加入开机」）；「已加载」列表可卸载任意已加载的 LKM，
+  包括不是本模块导入的。
+- **WebUI**：状态面板、模块管理、参数与开关、日志查看；HTML/CSS/JS 分离。
+  导入与热加载都走系统文件选择器，已加载列表读 `/proc/modules`，页面里没有目录浏览器。
+  同时适配管理器的两代 exec 接口（回调式 `ksu.exec(cmd, opts, name)` 与 Promise 式）。
 - **KMI 适配**：多内核版本的 ko 打进同一个 zip，安装时按设备的 `androidNN-M.m` 自动挑选。
 
 ## 目录结构
@@ -75,7 +79,7 @@ make KDIR=/opt/ddk/kdir/android16-6.12                     # VER 按目录名推
 ./build-all.sh
 
 # 5. 打包（每个 ko 都会校验 ELF/ET_REL/vermagic，并回读 zip 内容）
-./scripts/package.sh     # -> dist/lkmloader-v1.2.0.zip
+./scripts/package.sh     # -> dist/lkmloader-v1.2.5.zip
 ```
 
 CI 见 `.github/workflows/build.yml`，用 docker 版 ddk 逐个 target 构建后打包。
@@ -87,9 +91,12 @@ CI 见 `.github/workflows/build.yml`，用 docker 版 ddk 逐个 target 构建�
 
 ### 1. 导入 ko
 
-WebUI → 模块 → 导入 .ko → 浏览设备目录（默认 `/sdcard/Download`，可切快捷入口或手动输入路径），
-选中后文件会被复制到 `/data/adb/modules/lkmloader/lkm/<name>.ko` 并写入配置，
-随后立即尝试加载一次。
+WebUI → 模块 → 导入 .ko：直接拉起**Android 的文件选择器**（`<input type="file">`），
+第三方文件管理器能接管就由它接管，模块自己不再画目录树。
+
+文件先在前端校验（ELF64、`ET_REL`、大小），再以 base64 分段写进
+`/data/adb/modules/lkmloader/lkm/<name>.ko`，写完回读字节数确认，然后写入配置并加载一次。
+`content://` 拿不到真实路径，所以这一段必须走字节流。想先试试、不留痕就用下一条的「热加载」。
 
 ### 2. 选择加载时机
 
@@ -107,6 +114,20 @@ WebUI → 模块 → 导入 .ko → 浏览设备目录（默认 `/sdcard/Downloa
 
 状态页展示：loader 是否就绪、内核版本、构建 KMI、设备、平台、已导入模块的 KMI 是否匹配、
 `modules_disabled` 是否打开；`参数` 区显示 loader 当前开关；`日志` 区同时给出 loader 环形日志与开机加载日志。
+
+loader 是否加载以 `/proc/lkmctl` 为准，读不到时回退看 `/proc/modules`——两者都拿不到才提示未加载。
+若 WebUI 连命令都执行不了，状态卡会写「无法读取」，而不是假装「未加载」。
+
+### 4. 热加载 / 卸载别的 LKM
+
+- **热加载**：模块页右上角「热加载」选一个 `.ko`，字节落到 `/data/local/tmp/lkm_hot/<name>.ko`
+  并立即交给 loader 挂进内核。不写 `config.json`，重启即失效；模块卡片带「临时」标记，
+  可随时卸载，也可以点「加入开机」转成常驻条目。
+- **已加载**：点「查看内核里已加载的模块」读 `/proc/modules`，本模块加载的排在最前并带「本模块」标记，
+  可搜索；点条目即卸载（引用计数大于 0 的和 loader 自身会禁用）。
+
+已加载列表只看内核当前状态，不去扫描 `/data/adb/modules`、Download 这类目录——
+文件在那儿不等于已经加载，扫盘还慢。
 
 ## 内核侧接口
 
